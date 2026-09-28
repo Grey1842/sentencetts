@@ -222,6 +222,32 @@ previous revision of those files under a new version number.
 If a version is already published, do not reuse its number for a rebuild — bump
 the patch level and note the superseded one in the AMO "What's new" field.
 
+## Repository & Version Control
+
+Initialized 2026-09-27, branch `main`, tracking the whole source tree (43 files
+at the time of writing). The full
+rationale lives in `../AGENT.md` → *Build → Repository, hooks, and the Chrome
+key*; the parts that matter to packaging:
+
+- **`chrome-build/` and both `.zip` bundles are gitignored** (regenerable).
+  Consequence: `git status` stays clean while a submission bundle goes stale, so
+  the freshness checks under *Creating the Submission ZIP* are the only tripwire.
+- **`build-source/chrome-key.pem` is gitignored and must stay that way.** It pins
+  the extension ID and the Piper `allowed_origins`; `build-chrome.js` exits 1
+  without it rather than minting a new one. Verify a restored backup:
+  `openssl pkey -in build-source/chrome-key.pem -pubout -outform DER | sha256sum`
+  → must begin `b6ecf49b455c8c297c695d998f40d28a`.
+- **`vendor/` is tracked on purpose** (23 MB; largest file 21 MB, under GitHub's
+  100 MB cap, so no Git LFS) because it ships inside the extension and must match
+  what AMO reviewed byte for byte.
+- **Guard hook:** `git config core.hooksPath .githooks` once per clone.
+  `.githooks/pre-commit` refuses a staged `*.pem`/`*.key` path or any staged file
+  whose content carries a `BEGIN … PRIVATE KEY` header, and warns when
+  `background.js` is committed while `background-src.js` differs. It is a local
+  speed bump — `--no-verify` bypasses it, so never `git add -f` a key.
+- The AMO zip must still exclude `.git/` (see *Do NOT include* above) — that
+  directory now actually exists.
+
 ## Native Messaging Host
 
 The Piper TTS engine requires a separately-installed native messaging host (`piper_host.py`). This is **not** bundled in the extension — users install it per `../PIPER_SETUP.md`. The extension only contains the client-side connection logic.

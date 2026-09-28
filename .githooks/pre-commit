@@ -1,0 +1,62 @@
+#!/bin/sh
+# Guard the one file in this repo whose loss (or leak) is expensive:
+# build-source/chrome-key.pem — the private RSA key that fixes the Chrome
+# extension ID b6ecf49b455c8c297c695d998f40d28a and the Piper native-messaging
+# allowed_origins.
+#
+# Two failure modes are blocked:
+#   1. staging a key-ish PATH (.pem/.key/.p12/.pfx/id_rsa), e.g. after a rename
+#      that stops matching .gitignore;
+#   2. staging any file whose CONTENT carries a private-key header, e.g. a key
+#      pasted into a script, a fixture, or a doc comment.
+#
+# Install once per clone:  git config core.hooksPath .githooks
+# Emergency bypass (think first):  git commit --no-verify
+
+set -u
+fail=0
+
+# --- 1. path check on everything staged (added/copied/modified/renamed) ----
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+bad_paths=$(printf '%s\n' "$staged" | grep -Ei '\.(pem|key|p12|pfx|kdbx)$|(^|/)id_(rsa|ecdsa|ed25519)$|chrome-key' || true)
+if [ -n "$bad_paths" ]; then
+  echo "pre-commit: REFUSING to commit private-key file path(s):" >&2
+  printf '  %s\n' $bad_paths >&2
+  echo "  Unstage: git restore --staged <file>   (they belong in .gitignore)" >&2
+  fail=1
+fi
+
+# --- 2. content check: private-key material in staged content --------------
+# Matches a PEM privacy-header line: the word BEGIN, any number of
+# algorithm/ENCRYPTED words, then the two words that end every such header.
+# Two things are deliberate here:
+#   * this file quotes no header VERBATIM, so the pattern cannot match its own
+#     source (it did, on the first commit of this hook);
+#   * `.githooks/*` is skipped anyway, so a future rule that does quote a header
+#     still cannot block its own commit.
+PK_HDR='BEGIN ([A-Za-z]+ )*PRIVATE KEY'
+for f in $staged; do
+  case "$f" in .githooks/*) continue ;; esac
+  [ -f "$f" ] || continue
+  if git show ":$f" 2>/dev/null | head -c 200000 | grep -qE -- "$PK_HDR"; then
+    echo "pre-commit: REFUSING to commit private-key MATERIAL in: $f" >&2
+    echo "  Remove it — the extension builds fine with the key present only on" >&2
+    echo "  disk and untracked (see .gitignore for the backup/verify recipe)." >&2
+    fail=1
+  fi
+done
+
+[ "$fail" -eq 0 ] || exit 1
+
+# --- 3. cheap reminder: the AMO source copy is a copy, not a source ---------
+if git diff --cached --name-only --diff-filter=ACMR | grep -q '^background\.js$'; then
+  if ! cmp -s background.js build-source/background-src.js; then
+    echo "pre-commit: background.js changed but build-source/background-src.js differs." >&2
+    echo "  AMO reviewers diff these two. If this commit ships a release, run:" >&2
+    echo "    cp background.js build-source/background-src.js   # this direction!" >&2
+    echo "  (warning only — not blocking)" >&2
+  fi
+fi
+
+exit 0
