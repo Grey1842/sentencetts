@@ -222,6 +222,20 @@ previous revision of those files under a new version number.
 If a version is already published, do not reuse its number for a rebuild — bump
 the patch level and note the superseded one in the AMO "What's new" field.
 
+**State as of 2026-09-27:** AMO carries exactly **one** published version of this
+add-on — **2.1.0** (slug `sentencetts-reader`, addon id 3066315, guid
+`{d4e8a2b1-7c3f-4a9e-8b2f-5e6d7c8a9b0f}`, reviewed 2026-09-07). Nothing from the
+2.2–2.3.x line was ever published, so **2.3.4 is still an unused number** and a
+rebuild can keep it. Verify before every submission — the count is the answer:
+
+```sh
+curl -s 'https://addons.mozilla.org/api/v5/addons/addon/sentencetts-reader/versions/?page_size=50' \
+  | grep -o '"version":"[^"]*"'
+```
+
+The slug appears nowhere in this repo (the GUID in `manifest.json` is the only
+pointer), which is why it is written down here.
+
 ## Repository & Version Control
 
 Initialized 2026-09-27, branch `main`, tracking the whole source tree (43 files
