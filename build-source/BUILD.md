@@ -29,7 +29,8 @@ below.
 | `manifest.chrome.json` | Manifest template for the Chrome/Edge build (`{{SPKI_B64}}` → generated `key`) |
 | `chrome-key.pem` | **Private** RSA key that fixes the Chrome extension ID (excluded from all zips) |
 | `build-chrome.js` | Assembles `../chrome-build/` + `sentencetts-reader-chrome.zip` |
-| `package.json` | Metadata and build verification scripts |
+| `check.js` | Read-only release gate (`node check.js`): version parity, the source-parity rule below, syntax of every shipped script, and the contents of both zips (parses the archives' central directories and CRC-compares each entry to the tree) |
+| `package.json` | Metadata plus the `verify` / `check` / `package` / `release` scripts that drive the checks below |
 | `BUILD.md` | This file |
 
 ## Verification Steps (Run by AMO Reviewers)
@@ -44,9 +45,9 @@ node -c background-src.js
 diff background-src.js ../background.js
 # Should produce no output (files are identical). If it does NOT: the copy in
 # this directory was not refreshed after the last background change. Refresh it
-# in THIS direction only — `cp ../background.js background-src.js`. The real
-# background script in the repo root is the source of truth; `package.json`'s
-# `build` script copies the other way and must not be run.
+# in THIS direction only — `cp ../background.js background-src.js`, i.e.
+# `npm run sync-source`. The real background script in the repo root is the
+# source of truth, and no script here copies the other way any more.
 
 # 3. Verify no eval/Function constructor usage
 grep -n "eval\|Function(" background-src.js
@@ -54,6 +55,9 @@ grep -n "eval\|Function(" background-src.js
 
 # 4. Verify CSP compliance
 # manifest.json must have content_security_policy.extension_pages.script-src = 'self'
+
+# 5. Or run all of the above, plus the zip-content checks, in one command
+node check.js
 ```
 
 ## Build Process
@@ -96,14 +100,17 @@ sentencetts-reader/
 └── build-source/          # ← THIS DIRECTORY (required by AMO)
     ├── background-src.js
     ├── package.json
+    ├── check.js
     └── BUILD.md
 ```
 
 ## Creating the Submission ZIP
 
-From the project root:
+From the project root. `npm run package` runs exactly this, plus a final
+`node build-source/check.js`:
 
 ```bash
+rm -f sentencetts-reader.zip   # zip UPDATES an existing archive — never reuse one
 zip -r sentencetts-reader.zip \
   manifest.json \
   background.js \
@@ -145,7 +152,15 @@ zip -r sentencetts-reader.zip \
 - Any `.git/` or `node_modules/` directories
 
 **Check the zip is actually current before submitting** — the one on disk sat at
-`2.3.2` for two releases while the tree moved on:
+`2.3.2` for two releases while the tree moved on. One command covers it:
+
+```bash
+node build-source/check.js     # exit 0 = safe to submit; 1 = rebuild first
+```
+
+It reads the archive's central directory and CRC-compares every entry against the
+working tree, so it catches a stale artefact *and* a forbidden one, and it checks
+the same invariants for the Chrome build. Spot checks by hand, if you prefer:
 
 ```bash
 unzip -p sentencetts-reader.zip manifest.json | grep '"version"'   # == manifest.json
@@ -153,6 +168,9 @@ cmp <(unzip -p sentencetts-reader.zip background.js) background.js  # silent = f
 unzip -l sentencetts-reader.zip | grep -c offscreen                # must be 0
 unzip -l sentencetts-reader.zip | grep -c chrome-key.pem           # must be 0
 ```
+
+`check.js` ships in this directory precisely so a reviewer can run it too — it is
+read-only, has no dependencies, and touches nothing.
 
 ## AMO Submission Text — the 2.3.4 upload
 
@@ -162,7 +180,7 @@ the instant you edit it — that self-inflicted staleness is precisely how the z
 ended up two releases behind once. Verify after the final build with `ls -l` +
 `sha256sum sentencetts-reader.zip` and record the numbers in `AGENT.md`, not here.
 
-The 2026-09-28 rebuild is **26 files / 31 entries (~6.7 MB)**, CRC-clean, with
+The 2026-09-28 rebuild is **27 files / 32 entries (~6.7 MB)**, CRC-clean, with
 every entry byte-identical to the tree — including
 `build-source/background-src.js` == `background.js` *inside* the archive, so the
 reviewer's `diff` is empty. Because AMO has served
