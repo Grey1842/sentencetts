@@ -154,6 +154,86 @@ unzip -l sentencetts-reader.zip | grep -c offscreen                # must be 0
 unzip -l sentencetts-reader.zip | grep -c chrome-key.pem           # must be 0
 ```
 
+## AMO Submission Text — the 2.3.4 upload
+
+Build the zip **last**, after every edit to this file: `build-source/BUILD.md`
+ships *inside* the submission package, so any size or hash written here goes stale
+the instant you edit it — that self-inflicted staleness is precisely how the zip
+ended up two releases behind once. Verify after the final build with `ls -l` +
+`sha256sum sentencetts-reader.zip` and record the numbers in `AGENT.md`, not here.
+
+The 2026-09-28 rebuild is **26 files / 31 entries (~6.7 MB)**, CRC-clean, with
+every entry byte-identical to the tree — including
+`build-source/background-src.js` == `background.js` *inside* the archive, so the
+reviewer's `diff` is empty. Because AMO has served
+**2.1.0** since 2026-09-07, these notes are **cumulative since 2.1.0**, not a
+2.3.4-only changelog. The repo has **no CHANGELOG**, so anything user-visible that
+landed only in 2.2.x / 2.3.1–2.3.2 is recorded nowhere — add it from your own notes.
+
+### Paste into "What's new"
+
+```
+New engine: Kokoro — offline neural TTS (Kokoro-82M) running entirely inside the
+extension. No binary to install, no API key, no account, no telemetry. It is
+opt-in: choose Kokoro in the popup, then press Download once (~88 MB, cached and
+reused by later versions, clearable from browser storage).
+
+Also in this release:
+- Kokoro is the only offline neural option on Firefox for Android.
+- Queue handling hardened: queued sentences are dropped when you skip ahead,
+  press Stop, or switch engine, and the model's worker is released on
+  stop/switch/5-minute idle so it stops holding RAM.
+- Kokoro's speed control drives the model's own tempo (0.5-2x).
+- Reliability fixes and automated behaviour tests added since 2.1.0.
+```
+
+### Paste into "Developer comments to reviewers"
+
+```
+First update since 2.1.0, so the size and diff are larger than a normal release.
+
+1. Size 730,600 -> ~6.7 MB. The delta is vendor/kokoro/: a vendored copy of
+   kokoro-js 1.2.1 (Apache-2.0, 2,135,146 B), the ONNX Runtime WASM build
+   ort-wasm-simd-threaded.jsep.wasm (MIT, 21,596,019 B) with its .mjs loader, and
+   vendor/kokoro/README.md recording provenance and licences. No code is fetched
+   at runtime; everything executable ships in this package.
+2. New host permission https://huggingface.co/* — used ONLY to download the 88 MB
+   Kokoro-82M q8 weights (Apache-2.0), and only after the user presses Download in
+   an explicit consent panel. The weights are not in this package, are never
+   auto-downloaded, and nothing else contacts that host.
+3. CSP gained exactly one value: 'wasm-unsafe-eval' in
+   content_security_policy.extension_pages, required by the ONNX Runtime WASM
+   runtime. 'self' is still the only script source; no remote code, no string eval.
+4. Source = production: no bundler, minifier or transpiler. The shipped background
+   script is byte-identical to the copy in this package:
+     diff background.js build-source/background-src.js     # empty
+5. nativeMessaging is unchanged from 2.1.0 — it belongs to the optional Piper
+   engine, which talks to a `piper` binary the user installs and registers
+   themselves. No host binary ships here.
+6. Kokoro inference runs in a dedicated module worker (kokoro-worker.js) owned by
+   the background script, never in a content script/page. The Chrome-only build
+   files (offscreen.html/offscreen.js) are intentionally absent from this Firefox
+   package; Firefox can construct a Worker directly.
+7. Data-collection declaration is unchanged from 2.1.0: websiteContent (required),
+   authenticationInfo (optional). No analytics, no telemetry, no server of ours.
+```
+
+### Before clicking Submit (Developer Hub — not part of the package)
+
+- [ ] **License.** The published version declares **All Rights Reserved** (AMO id
+  7057) while `README.md` §License and this file's §License both say **MIT**, and
+  the repo contains **no license file at all**. Either set the AMO field to MIT and
+  add a `LICENSE` file (then add it to the zip command above), or correct the docs.
+- [ ] **Privacy policy.** `has_privacy_policy` is false while the listing declares
+  required `websiteContent` collection.
+- [ ] **Icon.** AMO serves its default placeholder even though `icons/` holds 16–128
+  px PNGs — the listing icon is a separate Developer Hub upload.
+- [ ] **Previews / homepage.** `previews: []`, `homepage: null` — add screenshots
+  and the repo URL.
+- [ ] Channel **listed**; compatibility Firefox 140+ / Android 142+ (unchanged, and
+  it matches `manifest.json`).
+
+
 ## Chrome Build
 
 The shared files (`background.js`, `content.js`, `spa-main.js`, `content.css`,

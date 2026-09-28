@@ -280,13 +280,19 @@ let kokoroLastError = '';
 let kokoroIdleTimer = null;
 
 function kokoroNotReady() {
-  return new Error('Kokoro engine is disabled in this build (KOKORO_ENABLED=false — see the P7 memo in CLAUDE.md).');
+  return new Error('Kokoro engine is disabled in this build (KOKORO_ENABLED=false — see the P7 memo in AGENT.md).');
 }
 
 function kokoroRelease() {
   if (kokoroWorker) {
     try { kokoroWorker.terminate(); } catch (e) {}
     kokoroWorker = null;
+  }
+  // Chrome: the worker lives in the offscreen document — closing it frees the
+  // model's RAM and lets a later kokoroEnsureHost() recreate everything.
+  if (!IS_FIREFOX && api.offscreen && api.offscreen.closeDocument) {
+    try { api.offscreen.closeDocument(api.runtime.getURL('offscreen.html'))
+      .catch(() => {}); } catch (e) {}
   }
   // Any in-flight synthesis dies with the worker; fail those callers cleanly.
   kokoroPending.forEach((p) => { clearTimeout(p.timer); p.reject(new Error('Kokoro worker released')); });
@@ -296,64 +302,164 @@ function kokoroRelease() {
   kokoroProgress = { phase: 'idle', pct: 0, detail: '' };
 }
 
+// True when synthesis can start right now without a download: model already
+// in memory, or sitting in the transformers Cache Storage from an earlier
+// session. null (cache unreadable) counts as ready — the worker will then
+// just load what it needs, and lying "not downloaded" would block users.
+async function kokoroModelReady() {
+  if (kokoroModelLoaded) return true;
+  if (kokoroProgress.phase === 'downloading' || kokoroProgress.phase === 'loading') return false;
+  const cached = await kokoroCacheHasModel();
+  return cached !== false;
+}
+
+function kokoroIsBusy() {
+  // Never yank the worker while jobs are in flight or while it is
+  // mid-download/mid-load — terminating it then is what produced
+  // "Kokoro worker released" mid-sentence on Stop/content-reset.
+  if (kokoroPending.size > 0) return true;
+  return kokoroProgress.phase === 'downloading' || kokoroProgress.phase === 'loading';
+}
+
 function kokoroArmIdleRelease() {
   if (kokoroIdleTimer) clearTimeout(kokoroIdleTimer);
   kokoroIdleTimer = setTimeout(kokoroRelease, KOKORO_IDLE_RELEASE_MS);
 }
 
-function kokoroSpawn() {
-  if (kokoroWorker) return kokoroWorker;
-  const w = new Worker(api.runtime.getURL(KOKORO_WORKER_FILE), { type: 'module' });
-  w.onmessage = (ev) => {
-    const m = ev.data || {};
-    if (m.type === 'progress') {
-      kokoroProgress = { phase: m.phase, pct: m.pct, detail: m.detail };
-      if (m.phase === 'ready') kokoroModelLoaded = true;
-    } else if (m.type === 'synthesized') {
-      const p = kokoroPending.get(m.id);
-      if (p) { kokoroPending.delete(m.id); p.resolve(m.audio || []); }
-    } else if (m.type === 'synth-error') {
-      const p = kokoroPending.get(m.id);
-      if (p) { kokoroPending.delete(m.id); p.reject(new Error(m.error || 'Kokoro synthesis failed')); }
-    } else if (m.type === 'download-done') {
-      kokoroModelLoaded = true;
-      kokoroProgress = { phase: 'ready', pct: 100, detail: '' };
-    } else if (m.type === 'download-error') {
-      kokoroLastError = m.error || 'Kokoro download failed';
-      kokoroProgress = { phase: 'idle', pct: 0, detail: '' };
+// Chrome MV3's extension service worker has NO Worker constructor (verified:
+// typeof Worker === 'undefined' in Chromium 153), so the inference worker
+// cannot live here. There it runs inside an offscreen document
+// (offscreen.html + offscreen.js, chrome.offscreen reason WORKERS) and every
+// message is proxied over runtime messaging; Firefox's MV3 background is a
+// real DOM page and keeps the direct in-page module worker. The state machine
+// below (progress / pending jobs / errors) is identical for both transports.
+let kokoroSpawning = null;
+
+function kokoroEnsureHost() {
+  if (kokoroWorker) return Promise.resolve(kokoroWorker);
+  if (kokoroSpawning) return kokoroSpawning;
+  // Never throw synchronously (a missing vendor file makes new Worker throw) —
+  // callers are promise chains inside message handlers; a sync throw there
+  // would kill the handler without answering the popup/content caller.
+  try {
+    kokoroSpawning = Promise.resolve(IS_FIREFOX ? kokoroSpawn() : kokoroSpawnOffscreen())
+      .then((w) => { kokoroSpawning = null; return w; },
+        (e) => { kokoroSpawning = null; throw e; });
+  } catch (e) {
+    kokoroSpawning = Promise.reject(e);
+  }
+  // Unstick guard: if the spawn promise settles while the worker that kicked
+  // it off was already frozen mid-flight (Chrome MV3 suspends service workers
+  // between tasks; a hanging createDocument + suspend = wedge), a later retry
+  // would still wait on the dead promise. After a grace window beyond the
+  // 15s readiness timeout, treat the spawn as wedged and reset.
+  setTimeout(() => {
+    if (kokoroSpawning && !kokoroWorker) {
+      console.warn('[SentenceTTS][background][kokoro] spawn wedge detected — resetting');
+      kokoroSpawning = null;
     }
-  };
-  w.onerror = (ev) => {
-    // Worker startup failure (bad import, CSP, missing vendor file, ...).
-    const e = 'Kokoro worker failed to start: ' + ((ev && ev.message) || 'unknown error');
+  }, 20000);
+  return kokoroSpawning;
+}
+
+function kokoroSpawn() {
+  // Firefox only: DOM-window background page, Worker exists here.
+  const w = new Worker(api.runtime.getURL(KOKORO_WORKER_FILE), { type: 'module' });
+  kokoroWorker = w;
+  return Promise.resolve(w);
+}
+
+async function kokoroSpawnOffscreen() {
+  // Chrome only. createDocument is the source of truth: it resolves when the
+  // document exists (already up, or after creating it) and survives service
+  // worker restarts, so no cached "has offscreen" boolean is needed. The
+  // runtime.onMessage listener at the bottom of this file receives everything
+  // the offscreen bridge posts back.
+  await api.offscreen.createDocument({
+    url: api.runtime.getURL('offscreen.html'),
+    reasons: ['WORKERS'],
+    justification: 'Kokoro neural TTS: model download and WASM inference need Web Workers, which MV3 service workers do not provide.',
+  });
+  // Wait for the bridge's ready ping so the first kokoroPost cannot race the
+  // document's own script evaluation. This handler is the ONLY responder to
+  // the ping (sendResponse is what makes offscreen.js stop pinging).
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('Kokoro offscreen document did not signal readiness')), 15000);
+    const handler = (msg, _s, sendResponse) => {
+      if (msg && msg.type === '__kokoroOffscreenReady') {
+        clearTimeout(t);
+        api.runtime.onMessage.removeListener(handler);
+        if (typeof sendResponse === 'function') sendResponse({ ack: true });
+        resolve();
+      }
+    };
+    api.runtime.onMessage.addListener(handler);
+  });
+  kokoroWorker = { offscreen: true };
+  return kokoroWorker;
+}
+
+function handleKokoroMessage(m) {
+  if (m.type === 'progress') {
+    kokoroProgress = { phase: m.phase, pct: m.pct, detail: m.detail };
+    if (m.phase === 'ready') kokoroModelLoaded = true;
+  } else if (m.type === 'synthesized') {
+    let audio = m.audio;
+    if (!audio && m.audioB64) {
+      audio = m.audioB64.map(base64ToArrayBuffer); // offscreen transport
+    }
+    const p = kokoroPending.get(m.id);
+    if (p) { kokoroPending.delete(m.id); p.resolve(audio || []); }
+  } else if (m.type === 'synth-error') {
+    const p = kokoroPending.get(m.id);
+    if (p) { kokoroPending.delete(m.id); p.reject(new Error(m.error || 'Kokoro synthesis failed')); }
+  } else if (m.type === 'download-done') {
+    kokoroModelLoaded = true;
+    kokoroProgress = { phase: 'ready', pct: 100, detail: '' };
+  } else if (m.type === 'download-error') {
+    kokoroLastError = m.error || 'Kokoro download failed';
+    kokoroProgress = { phase: 'idle', pct: 0, detail: '' };
+  } else if (m.type === '__kokoroError') {
+    // Offscreen worker startup failure (bad import, missing vendor file, ...).
+    const e = String(m.error || 'unknown error');
     console.error('[SentenceTTS][background][kokoro]', e);
     kokoroLastError = e;
     kokoroWorker = null;
     kokoroPending.forEach((p) => { clearTimeout(p.timer); p.reject(new Error(e)); });
     kokoroPending.clear();
-  };
-  kokoroWorker = w;
-  return w;
+  }
+}
+
+function kokoroPost(payload) {
+  if (!kokoroWorker) return Promise.reject(new Error('Kokoro worker not running'));
+  if (IS_FIREFOX) {
+    try { kokoroWorker.postMessage(payload); return Promise.resolve(); }
+    catch (e) { return Promise.reject(e); }
+  }
+  // Chrome: fire into the offscreen document (its listener responds void).
+  return api.runtime.sendMessage({ type: '__kokoroToOffscreen', payload })
+    .then(() => {}, (e) => { throw (e || new Error('Kokoro offscreen bridge unreachable')); });
 }
 
 function kokoroCall(payload, timeoutMs) {
   return new Promise((resolve, reject) => {
-    if (!kokoroWorker) kokoroSpawn();
-    const id = kokoroNextId++;
-    payload.id = id;
-    const timer = setTimeout(() => {
-      kokoroPending.delete(id);
-      reject(new Error('Kokoro synthesis timed out'));
-    }, timeoutMs);
-    kokoroPending.set(id, {
-      resolve: (v) => { clearTimeout(timer); resolve(v); },
-      reject: (e) => { clearTimeout(timer); reject(e); },
-    });
-    try { kokoroWorker.postMessage(payload); } catch (e) {
-      kokoroPending.delete(id);
-      clearTimeout(timer);
-      reject(e);
-    }
+    kokoroEnsureHost().then(() => {
+      const id = kokoroNextId++;
+      payload.id = id;
+      const timer = setTimeout(() => {
+        kokoroPending.delete(id);
+        reject(new Error('Kokoro synthesis timed out'));
+      }, timeoutMs);
+      kokoroPending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      kokoroPost(payload).catch((e) => {
+        kokoroPending.delete(id);
+        clearTimeout(timer);
+        reject(e);
+      });
+    }, reject);
   });
 }
 
@@ -378,6 +484,13 @@ function kokoroEnqueue(task) {
 
 async function kokoroSynthesize(text, voice, speed) {
   if (!text || !/[\p{L}\p{N}]/u.test(String(text))) return [];
+  // Fast-fail when the model was never downloaded: silently kicking off an
+  // ~88 MB download + cold WASM load from a Play press looked like "Kokoro
+  // plays nothing". The popup's Download button is the consent gate; direct
+  // users there instead of auto-downloading.
+  if (!(await kokoroModelReady())) {
+    throw new Error('Kokoro model not downloaded yet — open the popup and press "Download Kokoro model" once.');
+  }
   const res = await kokoroCall({
     type: 'synthesize',
     text: String(text),
@@ -629,8 +742,35 @@ if (/^file:/i.test(u)) {
 // message router
 // ============================================================
 
+// Offscreen bridge (Chrome build): the offscreen document posts every worker
+// event here, plus a readiness ping until we ack it. Firefox never sees these
+// types (it has no offscreen document).
+api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg) return false;
+  if (msg.type === '__kokoroFromOffscreen' && msg.message) {
+    handleKokoroMessage(msg.message);
+    return false;
+  }
+  // Do NOT ack the readiness ping here: this listener registers at SW startup,
+  // so acking would make offscreen.js stop pinging long before
+  // kokoroSpawnOffscreen() adds its own ready-handler (right after
+  // createDocument resolves) — the 15s readiness timeout then fires with the
+  // document perfectly healthy. Only the dedicated waiting handler acks.
+  if (msg.type === '__kokoroOffscreenReady') return false;
+  return false;
+});
+
 api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || !msg.type) return false;
+
+  // Internal Kokoro bridge traffic must NEVER reach the switch's default arm
+  // (which would sendResponse on it): '__kokoroFromOffscreen' is handled by
+  // the dedicated listener above, and a response to a readiness ping tells
+  // offscreen.js to STOP pinging — the default arm answering the very first
+  // ping exactly reproduced the "document did not signal readiness" timeout
+  // (pings stopped before kokoroSpawnOffscreen's handler was registered).
+  if (msg.type === '__kokoroFromOffscreen' || msg.type === '__kokoroOffscreenReady' ||
+      msg.type === '__kokoroToOffscreen') return false;
 
   switch (msg.type) {
     case 'ttsr-gcloud-synthesize':
@@ -702,21 +842,31 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // respond immediately — progress is observable via ttsr-kokoro-status
       // polling (kokoroProgress is mirrored here from worker events), so the
       // popup can close mid-download without holding a message channel open.
-      try {
-        kokoroLastError = '';
-        if (!kokoroWorker) kokoroSpawn();
-        kokoroWorker.postMessage({ type: 'download' });
-        sendResponse({ ok: true, started: true });
-      } catch (e) {
-        sendResponse({ ok: false, error: String((e && e.message) || e) });
-      }
+      kokoroLastError = '';
+      kokoroEnsureHost()
+        .then(() => kokoroPost({ type: 'download' }))
+        .then(() => sendResponse({ ok: true, started: true }))
+        .catch((e) => {
+          const m = String((e && e.message) || e);
+          console.error('[SentenceTTS][background][kokoro] download failed to start:', m);
+          kokoroLastError = m;
+          sendResponse({ ok: false, error: m });
+        });
       return true;
 
     case 'ttsr-kokoro-shutdown':
       // Fire-and-forget from content on stop: terminate the worker so the
       // model's RAM is freed now rather than on the idle timeout. Mirrors
-      // ttsr-piper-shutdown.
-      kokoroRelease();
+      // ttsr-piper-shutdown. NOT while busy: a shutdown can race an in-flight
+      // Play (hiccup breaker, content reset, Stop-after-Play) and yanking the
+      // worker then killed live synthesis with "Kokoro worker released" —
+      // skip the release and let the idle timer reclaim the RAM instead.
+      if (kokoroIsBusy()) {
+        console.warn('[SentenceTTS][background][kokoro] shutdown deferred — worker busy (jobs:', kokoroPending.size, 'phase:', kokoroProgress.phase + ')');
+        kokoroArmIdleRelease();
+      } else {
+        kokoroRelease();
+      }
       sendResponse({ ok: true });
       return true;
 
