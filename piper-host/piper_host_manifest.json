@@ -1,0 +1,9 @@
+{
+  "name": "sentencetts_piper",
+  "description": "Piper TTS bridge for SentenceTTS Reader (offline neural voices)",
+  "path": "/home/grey/Downloads/sentencetts/sentencetts-reader/piper-host/piper_host.py",
+  "type": "stdio",
+  "allowed_extensions": [
+    "{d4e8a2b1-7c3f-4a9e-8b2f-5e6d7c8a9b0f}"
+  ]
+}

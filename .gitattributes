@@ -1,0 +1,21 @@
+# Binary payloads in the extension package (Kokoro's ORT wasm, icons).
+*.wasm binary
+*.png  binary
+*.zip  binary
+
+# Vendored third-party bundles — committed on purpose (they ship inside the
+# extension) but they are minified upstream code: collapse them in GitHub diffs
+# so review attention lands on our own files.
+vendor/kokoro/kokoro.web.js            linguist-generated=true
+vendor/kokoro/ort-wasm-simd-threaded.jsep.mjs linguist-generated=true
+pdf/pdf.worker.mjs                     linguist-generated=true
+
+# NOTE: build-source/background-src.js is deliberately NOT marked generated.
+# It is a copy of background.js, and its freshness is a documented hazard
+# (AMO reviewers `diff` the two). Hiding it would make drift invisible.
+
+# Normalize line endings: LF in the repo, LF on checkout everywhere except any
+# Windows-authored native-host helper if one is ever added.
+* text=auto eol=lf
+*.png binary
+*.wasm binary

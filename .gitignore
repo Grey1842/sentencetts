@@ -1,0 +1,65 @@
+# ============================================================================
+# SentenceTTS Reader — what git must NOT track
+# Rule of thumb: anything regenerable from a build script is ignored; anything
+# that CANNOT be regenerated (the Chrome signing key!) is ignored too, but for
+# the opposite reason — it must never leave this machine except into a backup.
+# ============================================================================
+
+# ---- The private RSA key that fixes the Chrome extension ID ----------------
+# NEVER commit this. It is what pins the extension ID
+#   b6ecf49b455c8c297c695d998f40d28a
+# (first 32 hex chars of SHA-256 over the SPKI DER) and therefore the Piper
+# native-messaging `allowed_origins`. Losing it means a new extension ID and
+# orphaned installs. `build-source/build-chrome.js` exits 1 when it is missing
+# rather than silently minting a different ID, so a clone without the key still
+# builds — it just cannot reproduce the published ID.
+#
+# Verify a restored backup with:
+#   openssl pkey -in build-source/chrome-key.pem -pubout -outform DER | sha256sum
+#   -> must start with  b6ecf49b455c8c297c695d998f40d28a
+build-source/chrome-key.pem
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ---- Build output: fully regenerated, never a source of truth -------------
+# chrome-build/ is assembled from the repo root by build-chrome.js, including
+# manifest.json (key baked in), piper-host-manifest.json and
+# install-piper-host.sh (both generated inside that script).
+chrome-build/
+
+# Submission bundles. Chrome: produced by build-chrome.js.
+# Firefox: the `zip -r` line in build-source/BUILD.md.
+/*.zip
+
+# ---- Vendored deps stay COMMITTED (vendor/ is not listed here on purpose) --
+# vendor/kokoro/ is checked in deliberately: kokoro-js + the ONNX Runtime wasm
+# ship inside the extension and must be byte-identical to what was reviewed by
+# AMO. Largest file is 21 MB (ort-wasm-…jsep.wasm), comfortably under GitHub's
+# 100 MB per-file cap, so no Git LFS is required.
+
+# ---- Python (piper-host native messaging host) ----------------------------
+__pycache__/
+*.py[cod]
+
+# ---- Node -----------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ---- Test scratch ---------------------------------------------------------
+# The e2e scripts currently resolve playwright-core out of /tmp/e2e and want
+# PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers (see AGENT.md open item 6). If that
+# bootstrap ever moves in-tree, keep the artifacts out of git anyway.
+test-results/
+playwright-report/
+/tmp-e2e/
+
+# ---- Local agent / editor / OS cruft --------------------------------------
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.log

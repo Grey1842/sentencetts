@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "SentenceTTS Reader",
+  "version": "2.3.4",
+  "description": "Reads any webpage or PDF aloud with live sentence highlighting — offline via your browser's voices or the built-in Kokoro engine, or online with Google Cloud Text-to-Speech (incl. English-India neural voices). Piper needs a one-time local setup; the popup shows the steps.",
+  "permissions": ["storage", "activeTab", "nativeMessaging"],
+  "host_permissions": [
+    "<all_urls>",
+    "file:///*",
+    "https://texttospeech.googleapis.com/*",
+    "https://translate.google.com/*",
+    "https://huggingface.co/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self' blob:;"
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["spa-main.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SentenceTTS Reader",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "64": "icons/icon-64.png",
+      "96": "icons/icon-96.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "64": "icons/icon-64.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "{d4e8a2b1-7c3f-4a9e-8b2f-5e6d7c8a9b0f}",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": ["websiteContent"],
+        "optional": ["authenticationInfo"]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
+  }
+}
