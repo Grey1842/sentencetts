@@ -532,6 +532,21 @@ async function main() {
   check('content never runs kokoro inference locally (background-only message types)',
     /'ttsr-kokoro-synthesize', 'ttsr-kokoro-status',/.test(content) &&
     !/KokoroTTS|from_pretrained/.test(content));
+  // --- 11b) every read-head mover cancels BOTH engine queues -------------------
+  // Three paths move the read head mid-playback: skip(), the ttsr-jump message,
+  // and the in-page sentence click. Kokoro is the most expensive engine here, so a
+  // mover that forgets kokoroCancel() burns up to a full prefetch depth (3) of ONNX
+  // passes on the sentence the user just left. The watermark drops the results, so
+  // nothing audible breaks — which is exactly how the click path shipped without it.
+  {
+    const start = content.lastIndexOf("document.addEventListener('click', (e) => {");
+    const clickBody = content.slice(start, content.indexOf('\n    });', start));
+    check('sentence-click mover cancels the Kokoro queue as well as Piper',
+      start !== -1 && /piperCancel\(\);/.test(clickBody) && /kokoroCancel\(\);/.test(clickBody));
+    const callsOf = (name) => (content.match(new RegExp(name + '\\(\\);', 'g')) || []).length;
+    check('all three read-head movers cancel both queues (skip, ttsr-jump, click)',
+      callsOf('piperCancel') === 3 && callsOf('kokoroCancel') === callsOf('piperCancel'));
+  }
 
   // background.js: real runtime behind the kill switch, same FIFO+watermark
   // discipline as Piper, worker freed on stop/idle.

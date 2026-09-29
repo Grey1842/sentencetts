@@ -1522,6 +1522,7 @@
       STATE.isPlaying = true; STATE.isPaused = false;
       STATE.gen += 1; teardownAudioEl(); systemStop();
       piperCancel();
+      kokoroCancel(); // drop queued Kokoro work too (no-op for other engines)
       writeSession({ playing: true, paused: false, index: idx });
       showPlayer();
       if (isAudioEngine()) audioPlay(idx); else systemSpeak(idx);
