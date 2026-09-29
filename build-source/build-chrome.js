@@ -42,6 +42,7 @@ for (const f of [
   'popup.html', 'popup.js', 'popup.css',
   'pdfviewer.html', 'pdfviewer.js',
   'offscreen.html', 'offscreen.js',
+  'LICENSE',
 ]) {
   fs.copyFileSync(path.join(root, f), path.join(outDir, f));
 }

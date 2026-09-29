@@ -73,6 +73,7 @@ The submission ZIP must contain:
 ```
 sentencetts-reader/
 ├── manifest.json
+├── LICENSE                # MIT, "Copyright (c) 2026 Shashi Bhushan Kumar"
 ├── background.js          # ← identical to build-source/background-src.js
 ├── kokoro-worker.js       # Kokoro inference worker (module worker, ESM)
 ├── content.js
@@ -113,6 +114,7 @@ From the project root. `npm run package` runs exactly this, plus a final
 rm -f sentencetts-reader.zip   # zip UPDATES an existing archive — never reuse one
 zip -r sentencetts-reader.zip \
   manifest.json \
+  LICENSE \
   background.js \
   kokoro-worker.js \
   content.js \
@@ -238,10 +240,12 @@ First update since 2.1.0, so the size and diff are larger than a normal release.
 
 ### Before clicking Submit (Developer Hub — not part of the package)
 
-- [ ] **License.** The published version declares **All Rights Reserved** (AMO id
-  7057) while `README.md` §License and this file's §License both say **MIT**, and
-  the repo contains **no license file at all**. Either set the AMO field to MIT and
-  add a `LICENSE` file (then add it to the zip command above), or correct the docs.
+- [ ] **License → MIT.** The repo side is settled: `LICENSE` (MIT, "Copyright (c)
+  2026 Shashi Bhushan Kumar") now exists, ships inside the archive, and matches
+  `package.json` (`"license": "MIT"` + author) and both docs. The **published
+  listing still declares All Rights Reserved (AMO id 7057)** — set the listing's
+  License field to MIT in the same pass as the upload, or the store page will
+  contradict the code you just shipped.
 - [ ] **Privacy policy.** `has_privacy_policy` is false while the listing declares
   required `websiteContent` collection.
 - [ ] **Icon.** AMO serves its default placeholder even though `icons/` holds 16–128
@@ -422,8 +426,13 @@ This allows:
 
 ## License
 
-MIT — see individual files for any third-party licenses. This changed in 2.3.0:
-the extension now **vendors** third-party code under `vendor/kokoro/` —
-`kokoro-js` (Apache-2.0) and the `onnxruntime-web` WASM build (MIT). The
-Kokoro-82M weights (Apache-2.0) are not shipped; they are downloaded at runtime
-behind explicit consent. Google TTS and Piper remain external services/binaries.
+MIT — **Copyright (c) 2026 Shashi Bhushan Kumar**, in `LICENSE` at the repo root.
+That file ships **inside** the submission archive (unlike `README.md`/`AGENT.md`,
+which are repo-only), so a reviewer unpacking the submitted zip sees the same terms
+`package.json` declares. It is deliberately the verbatim MIT text and covers this
+add-on's own code; the third-party record lives next to the third-party code —
+`vendor/kokoro/README.md` documents **kokoro-js** (Apache-2.0) and the
+**onnxruntime-web** WASM build (MIT). This began mattering in 2.3.0, when the
+extension started **vendoring** that code under `vendor/kokoro/`. The Kokoro-82M
+weights (Apache-2.0) are not shipped; they are downloaded at runtime behind
+explicit consent. Google TTS and Piper remain external services/binaries.

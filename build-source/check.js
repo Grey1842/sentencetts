@@ -192,7 +192,7 @@ console.log('\nFirefox submission zip');
     const names = [...entries.keys()];
 
     const required = [
-      'manifest.json', 'background.js', 'kokoro-worker.js', 'content.js', 'spa-main.js',
+      'manifest.json', 'LICENSE', 'background.js', 'kokoro-worker.js', 'content.js', 'spa-main.js',
       'content.css', 'popup.html', 'popup.js', 'popup.css', 'pdfviewer.html', 'pdfviewer.js',
       'pdf/pdf.mjs', 'pdf/pdf.worker.mjs',
       'vendor/kokoro/kokoro.web.js', 'vendor/kokoro/ort-wasm-simd-threaded.jsep.wasm',
@@ -253,6 +253,7 @@ console.log('\nChrome build');
     'background.js', 'content.js', 'spa-main.js', 'content.css',
     'popup.html', 'popup.js', 'popup.css',
     'pdfviewer.html', 'pdfviewer.js', 'offscreen.html', 'offscreen.js', 'kokoro-worker.js',
+    'LICENSE',
   ];
   const dirs = ['pdf', 'icons', 'vendor'];
   if (!exists(at('chrome-build', 'manifest.json'))) {

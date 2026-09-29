@@ -262,7 +262,9 @@ isn't registered — see `PIPER_SETUP.md`.
 
 ## License
 
-MIT. The Piper native messaging host (`piper-host/piper_host.py`) is the bridge
+MIT — **Copyright (c) 2026 Shashi Bhushan Kumar**, full text in [`LICENSE`](LICENSE),
+which also ships inside the extension archive. The Piper native messaging host
+(`piper-host/piper_host.py`) is the bridge
 to the externally-installed `piper` binary; Piper itself and Google TTS are
 external services — see their respective licenses.
 

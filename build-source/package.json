@@ -9,7 +9,7 @@
     "build:chrome": "node build-chrome.js",
     "verify": "node -c background-src.js && node -c build-chrome.js && node -c check.js && node ../tests/run.js",
     "check": "node check.js",
-    "package": "cd .. && rm -f sentencetts-reader.zip && zip -rq sentencetts-reader.zip manifest.json background.js kokoro-worker.js content.js spa-main.js content.css popup.html popup.js popup.css pdfviewer.html pdfviewer.js pdf/ vendor/ icons/ build-source/ -x \"build-source/chrome-key.pem\" \"build-source/manifest.chrome.json\" \"build-source/build-chrome.js\"",
+    "package": "cd .. && rm -f sentencetts-reader.zip && zip -rq sentencetts-reader.zip manifest.json LICENSE background.js kokoro-worker.js content.js spa-main.js content.css popup.html popup.js popup.css pdfviewer.html pdfviewer.js pdf/ vendor/ icons/ build-source/ -x \"build-source/chrome-key.pem\" \"build-source/manifest.chrome.json\" \"build-source/build-chrome.js\"",
     "package:chrome": "node build-chrome.js",
     "release": "npm run verify && npm run package && node check.js"
   },
@@ -21,7 +21,7 @@
     "text-to-speech",
     "sentence-highlighting"
   ],
-  "author": "",
+  "author": "Shashi Bhushan Kumar",
   "license": "MIT",
   "devDependencies": {}
 }
