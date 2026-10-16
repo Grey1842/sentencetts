@@ -56,6 +56,12 @@ test-results/
 playwright-report/
 /tmp-e2e/
 
+# ---- Internal dev docs: never publish to GitHub ------------------------------
+# AGENT.md is the local architecture handbook; KOKORO_SPIKE.md is spike notes.
+# Both live on disk for development but must not be tracked or pushed.
+AGENT.md
+KOKORO_SPIKE.md
+
 # ---- Local agent / editor / OS cruft --------------------------------------
 .claude/settings.local.json
 .DS_Store
