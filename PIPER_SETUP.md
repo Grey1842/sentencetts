@@ -200,6 +200,20 @@ defined in `manifest.json` (see **Important: Extension ID Changes** for
 the current value and how to keep the installed manifest in sync). No
 data leaves your machine — all TTS synthesis happens locally.
 
+Two further hardening rules are enforced by the host itself:
+
+- **Model names are bare filenames only.** The `model` field arrives from
+  extension storage and is never trusted as a path: absolute paths and
+  anything containing a path separator are rejected outright, so a
+  tampered preference cannot point the `piper` binary at an arbitrary
+  file on disk. Use the filename exactly as the popup's model list shows
+  it (e.g. `en_US-arctic-medium.onnx`).
+- **A hung `piper` is killed after 110 seconds.** A wedged model load or
+  stalled synthesis can no longer pin the host's RAM indefinitely: the
+  host kills the subprocess and returns a "timed out" error, which the
+  extension classifies as non-retryable (just under its own 120 s
+  timeout ceiling).
+
 ## Important: Extension ID Changes
 
 If the extension's `gecko.id` in `manifest.json` ever changes, you **must**

@@ -13,6 +13,9 @@
 //     Storage so it happens exactly once per device
 //   - single-job synthesis (the background serializes anyway — one FIFO,
 //     one watermark — mirroring the Piper single-flight discipline)
+//   - between-chunk cancellation: a 'cancel' note from the background
+//     abandons the running job at the next chunk boundary (skip / jump /
+//     click-to-jump), so the next real job never queues behind dead work
 //   - WAV encoding (24 kHz mono PCM16) so background/content never see
 //     raw Float32 tensors
 //
@@ -39,6 +42,7 @@ const SPEED_MAX = 2;
 let tts = null;              // loaded KokoroTTS instance
 let loadPromise = null;      // in-flight load (download + session init)
 let progress = { phase: 'idle', pct: 0, detail: '' };
+let cancelRequested = false; // set by a 'cancel' note; consumed between chunks
 
 function reportProgress(phase, pct, detail) {
   progress = { phase, pct, detail: detail || '' };
@@ -82,7 +86,7 @@ function splitForKokoro(text) {
   if (t.length <= MAX_CHARS) return [t];
   const parts = [];
   let buf = '';
-  const pieces = t.match(/[^.!?…]+[.!?…]+["'”’)\]]*\s*|[^.!?…]+$/g) || [t];
+  const pieces = t.match(/[^.!?。！？।॥؟…]+[.!?。！？।॥؟…]+["'”’)\]」』]*\s*|[^.!?。！？।॥؟…]+$/g) || [t];
   for (const piece of pieces) {
     if (buf && (buf + piece).length > MAX_CHARS) { parts.push(buf.trim()); buf = piece; }
     else { buf = (buf ? buf + ' ' : '') + piece; }
@@ -128,12 +132,30 @@ function encodeWav(samples, sampleRate) {
 
 self.onmessage = async (ev) => {
   const msg = ev.data || {};
+  // Skip/jump/click-to-jump in the content script: the background bumped
+  // its watermark (dropping every queued job) and posted this note to stop
+  // the RUNNING job as well. Inference can't be aborted mid-pass, but the
+  // loop below checks between chunks, so an abandoned multi-chunk sentence
+  // stops after the chunk in flight. The flag is reset at the start of
+  // every new job, so a cancel that lands while idle (or after the final
+  // chunk) can never kill the next legitimate synthesis.
+  if (msg.type === 'cancel') {
+    cancelRequested = true;
+    return;
+  }
   try {
     if (msg.type === 'synthesize') {
+      cancelRequested = false;
       const inst = await ensureModel();
       const chunks = splitForKokoro(msg.text);
       const out = [];
       for (let i = 0; i < chunks.length; i++) {
+        if (cancelRequested) {
+          // Not an error — the caller moved on. background.js resolves this
+          // as a sentinel rejection that content's catch ignores silently.
+          self.postMessage({ type: 'cancelled', id: msg.id });
+          return;
+        }
         const audio = await inst.generate(chunks[i], {
           voice: msg.voice || DEFAULT_VOICE,
           speed: Math.min(SPEED_MAX, Math.max(SPEED_MIN, Number(msg.speed) || 1)),

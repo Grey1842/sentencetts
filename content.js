@@ -107,6 +107,40 @@
       if (why) showHiccup('speed ' + v.toFixed(1) + 'x');
       updatePlayer();
     }
+    // Bold filled transport icons (24x24 Material paths) — Unicode glyphs
+    // render thin or as emoji depending on OS/font.
+    const ICON_PATH = {
+      play: 'M8 5v14l11-7z',
+      pause: 'M6 19h4V5H6v14zm8-14v14h4V5h-4z',
+      prev: 'M6 6h2v12H6V6zm3.5 6l8.5 6V6l-8.5 6z',
+      next: 'M6 6l8.5 6L6 18V6zM16 6v12h2V6h-2z',
+      stop: 'M5 5h14v14H5z',
+    };
+
+    function svgIcon(d, w, h) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('width', String(w));
+      svg.setAttribute('height', String(h));
+      svg.setAttribute('fill', 'currentColor');
+      svg.setAttribute('aria-hidden', 'true');
+      const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      p.setAttribute('d', d);
+      svg.appendChild(p);
+      return svg;
+    }
+
+    function playerBtn(act, cls, d, aria) {
+      const btn = document.createElement('button');
+      btn.setAttribute('data-act', act);
+      if (cls) btn.className = cls;
+      if (aria) {
+        btn.setAttribute('title', aria);
+        btn.setAttribute('aria-label', aria);
+      }
+      if (d) btn.appendChild(svgIcon(d, 14, 14));
+      return btn;
+    }
     function ensurePlayer() {
       if (playerEl && playerEl.isConnected) return playerEl;
       const bar = document.createElement('div');
@@ -121,14 +155,20 @@
         'padding:6px 12px', 'border-radius:999px',
         'box-shadow:0 4px 18px rgba(0,0,0,0.4)',
       ].join(';');
-      bar.innerHTML =
-        '<button data-act="prev" title="Previous sentence" aria-label="Previous sentence">⏮</button>' +
-        '<button data-act="toggle" class="ttsr-toggle" aria-label="Pause or resume">⏸</button>' +
-        '<button data-act="next" title="Next sentence" aria-label="Next sentence">⏭</button>' +
-        '<button data-act="stop" class="ttsr-stop" title="Stop" aria-label="Stop">■</button>' +
-        '<button data-act="slower" title="Slower" aria-label="Slower">−</button>' +
-        '<button data-act="faster" title="Faster" aria-label="Faster">+</button>' +
-        '<span class="ttsr-player-status" aria-live="polite"></span>';
+      bar.appendChild(playerBtn('prev', '', ICON_PATH.prev, 'Previous sentence'));
+      bar.appendChild(playerBtn('toggle', 'ttsr-toggle', ICON_PATH.pause, 'Pause or resume'));
+      bar.appendChild(playerBtn('next', '', ICON_PATH.next, 'Next sentence'));
+      bar.appendChild(playerBtn('stop', 'ttsr-stop', ICON_PATH.stop, 'Stop'));
+      const slower = playerBtn('slower', '', null, 'Slower');
+      slower.textContent = '−';
+      bar.appendChild(slower);
+      const faster = playerBtn('faster', '', null, 'Faster');
+      faster.textContent = '+';
+      bar.appendChild(faster);
+      const status = document.createElement('span');
+      status.className = 'ttsr-player-status';
+      status.setAttribute('aria-live', 'polite');
+      bar.appendChild(status);
       bar.addEventListener('click', (e) => {
         const btn = e.target.closest && e.target.closest('button');
         const act = btn && btn.dataset.act;
@@ -162,7 +202,8 @@
       const toggle = playerEl.querySelector('[data-act="toggle"]');
       const status = playerEl.querySelector('.ttsr-player-status');
       if (toggle) {
-        toggle.textContent = STATE.isPaused ? '▶' : '⏸';
+        toggle.textContent = '';
+        toggle.appendChild(svgIcon(STATE.isPaused ? ICON_PATH.play : ICON_PATH.pause, 14, 14));
         toggle.title = STATE.isPaused ? 'Resume' : 'Pause';
         toggle.setAttribute('aria-label', STATE.isPaused ? 'Resume' : 'Pause');
       }
@@ -604,7 +645,11 @@
       if (!n) return [];
       const sentences = [];
       let start = 0;
-      const boundaryRe = /[.!?]+(?:["'”’)\]]+)?(?=\s|$)/g;
+      // Terminators beyond Latin punctuation: danda (। ॥) for Hindi/
+      // Marathi/Sanskrit, fullwidth 。！？ for CJK, Arabic ؟. The lookahead
+      // also accepts a CJK character right after the terminator, since CJK
+      // prose is not space-separated.
+      const boundaryRe = /[.!?。！？।॥؟]+(?:["'”’)\]」』]+)?(?=\s|[\u3040-\u30FF\u3400-\u9FFF]|$)/g;
       let match;
       while ((match = boundaryRe.exec(n)) !== null) {
         const end = match.index + match[0].length;
@@ -690,7 +735,7 @@
             sentences.push({ el: span, text: part });
             idx += 1;
           });
-          try { block.replaceChildren(frag); } catch (e) { block.innerHTML = ''; block.appendChild(frag); }
+          try { block.replaceChildren(frag); } catch (e) { block.textContent = ''; block.appendChild(frag); }
           if (b % PREPARE_BATCH === PREPARE_BATCH - 1) await yieldFrame();
         }
         STATE.sentences = sentences;
@@ -793,10 +838,10 @@
           systemSpeak(i + 1);
         }
       };
-      u.onerror = () => {
+      u.onerror = (ev) => {
         if (my === STATE.gen && STATE.utterance === u) {
           if (STATE.isPlaying && !STATE.isPaused) {
-            const er = u.error && u.error.name ? String(u.error.name) : '';
+            const er = ev && ev.error && ev.error.name ? String(ev.error.name) : '';
             if (er === 'canceled' || er === 'interrupted') return;
             // Mirrors the audio-engine retry: a transient speech-engine hiccup
             // is retried once in place before the sentence is skipped.
@@ -1012,6 +1057,25 @@
         // (and still let the circuit breaker stop a truly dead endpoint).
         if (my === STATE.gen && STATE.isPlaying && !STATE.isPaused) {
           const msg = err && err.message ? String(err.message) : 'unknown error';
+          // Background reports a worker-side cancel of this sentence's
+          // synthesis (skip / jump / click-to-jump moved the read head away
+          // from it mid-synthesis): not a failure — no hiccup, no retry, no
+          // circuit-breaker tick, or the retry would re-enqueue the
+          // abandoned sentence behind the one now playing.
+          if (msg === 'Kokoro synthesis cancelled') return;
+          // A download that is mid-flight is NOT terminal: keep waiting (no
+          // retry-budget burn) and surface the live percentage until the
+          // weights land, then this same sentence synthesizes normally.
+          if (/still downloading/.test(msg)) {
+            const pct = (msg.match(/\d+%/) || ['?'])[0];
+            showHiccup('Kokoro model still downloading (' + pct + ') — playback starts when it finishes…');
+            setTimeout(() => {
+              if (my === STATE.gen && STATE.isPlaying && !STATE.isPaused) {
+                audioPlay(i, retryLeft);
+              }
+            }, SENTENCE_RETRY_DELAY_MS);
+            return;
+          }
           // A "model not downloaded" fast-fail is terminal for this Play —
           // retrying sentence-by-sentence would only spam identical failures.
           if (/not downloaded yet/.test(msg)) {
@@ -1533,6 +1597,10 @@
     // Kick off after the page settles (avoids racing lazy-loaded content).
     setTimeout(tryAutoResume, 400);
   } catch (err) {
-    // Never let a content-script error take the page down with it.
+    // Never let a content-script error take the page down with it — but a
+    // fully silent catch turns field reports into guesswork, so surface the
+    // message once. (console.warn is allowed; console.log is not.)
+    console.warn('[SentenceTTS] content script init failed:',
+      (err && err.message) ? err.message : String(err));
   }
 })();

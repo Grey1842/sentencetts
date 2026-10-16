@@ -67,9 +67,12 @@ function savePrefs() {
 
 let voiceRows = [];
 async function rebuildVoices() {
-  voiceRows = [];
   const engine = prefs.engine;
   const q = (els.voiceSearch.value || '').trim().toLowerCase();
+  // Build locally and assign atomically: clearing the shared array BEFORE the
+  // async fetch left an empty-list window where a datalist pick's commit
+  // found no match and silently dropped the user's first selection.
+  const next = [];
   if (engine === 'gfree') {
     [
       { id: 'en', label: 'English (Google Free)' },
@@ -81,12 +84,12 @@ async function rebuildVoices() {
       { id: 'te', label: 'Telugu — Google Free' },
       { id: 'mr', label: 'Marathi — Google Free' },
       { id: 'bn', label: 'Bengali — Google Free' },
-    ].forEach((o) => voiceRows.push({ id: o.id, label: o.label }));
+    ].forEach((o) => next.push({ id: o.id, label: o.label }));
   } else if (engine === 'gcloud') {
     try {
       const res = await api.runtime.sendMessage({ type: 'ttsr-gcloud-list-voices' });
       if (res && res.ok && res.voices) {
-        res.voices.forEach((v) => voiceRows.push({ id: v.name, label: v.name + ' (' + (v.lang || '') + ')' }));
+        res.voices.forEach((v) => next.push({ id: v.name, label: v.name + ' (' + (v.lang || '') + ')' }));
       }
     } catch (e) {}
   } else if (engine === 'piper') {
@@ -95,16 +98,17 @@ async function rebuildVoices() {
       if (res && res.ok && res.models) {
         res.models.forEach((m) => {
           const id = typeof m === 'string' ? m : (m.id || m.name || String(m));
-          voiceRows.push({ id, label: typeof m === 'string' ? m : (m.label || m.name || String(m)) });
+          next.push({ id, label: typeof m === 'string' ? m : (m.label || m.name || String(m)) });
         });
       }
     } catch (e) {}
   } else {
     const vs = (typeof speechSynthesis !== 'undefined' && speechSynthesis.getVoices()) || [];
     const eng = vs.filter((v) => /^en/i.test(v.lang));
-    (eng.length ? eng : vs).forEach((v) => voiceRows.push({ id: v.name, label: v.name + ' (' + v.lang + ')' }));
+    (eng.length ? eng : vs).forEach((v) => next.push({ id: v.name, label: v.name + ' (' + v.lang + ')' }));
   }
-  els.voiceList.innerHTML = '';
+  voiceRows = next;
+  els.voiceList.textContent = '';
   voiceRows.filter((v) => !q || v.label.toLowerCase().includes(q) || v.id.toLowerCase().includes(q))
     .forEach((v) => {
       const opt = document.createElement('option');
@@ -112,8 +116,10 @@ async function rebuildVoices() {
       opt.label = v.label;
       els.voiceList.appendChild(opt);
     });
+  // Show the active voice, but never while the user is typing — the input IS
+  // the filter here, and overwriting it mid-typing clobbered every keystroke.
   const cur = voiceRows.find((v) => v.id === prefs.voice);
-  if (cur) els.voiceSearch.value = cur.label;
+  if (cur && document.activeElement !== els.voiceSearch) els.voiceSearch.value = cur.label;
 }
 
 els.engine.addEventListener('change', () => {
@@ -132,9 +138,22 @@ els.pitch.addEventListener('input', () => {
   els.pitchVal.textContent = prefs.pitch.toFixed(1);
   savePrefs();
 });
-els.voiceSearch.addEventListener('input', () => rebuildVoices());
+els.voiceSearch.addEventListener('input', (e) => {
+  // Firefox fires only 'input' (not 'change') for datalist picks — 'change'
+  // arrives on blur/Enter — so an exact match commits at once on input.
+  // Deletion events only filter, so backspacing can never mis-commit.
+  const typed = (els.voiceSearch.value || '').trim();
+  const exact = voiceRows.find((v) => v.label === typed || v.id === typed);
+  const isDelete = e && e.inputType && e.inputType.indexOf('delete') === 0;
+  if (exact && !isDelete) {
+    prefs.voice = exact.id;
+    savePrefs();
+    return;
+  }
+  rebuildVoices();
+});
 els.voiceSearch.addEventListener('change', () => {
-  const typed = els.voiceSearch.value;
+  const typed = els.voiceSearch.value.trim();
   const match = voiceRows.find((v) => v.label === typed || v.id === typed);
   if (match) { prefs.voice = match.id; savePrefs(); }
 });
@@ -160,7 +179,7 @@ function countSentencesPerBlock(text) {
   if (!n) return 0;
   let count = 0;
   let start = 0;
-  const re = /[.!?]+(?:["'”’)\]]+)?(?=\s|$)/g;
+  const re = /[.!?。！？।॥؟]+(?:["'”’)\]」』]+)?(?=\s|[\u3040-\u30FF\u3400-\u9FFF]|$)/g;
   let m;
   while ((m = re.exec(n)) !== null) {
     const end = m.index + m[0].length;
@@ -295,6 +314,32 @@ function schedulePage(n) {
 // Render the page shown at top of the stage, once
 setTimeout(() => { if (canvasVisible && currentRenderedPage === 0 && numPages) schedulePage(1); }, 600);
 
+// Bold filled transport icons (24x24 Material paths) — Unicode glyphs render
+// thin or as emoji depending on OS/font.
+const ICON_PLAY_PATH = 'M8 5v14l11-7z';
+const ICON_PAUSE_PATH = 'M6 19h4V5H6v14zm8-14v14h4V5h-4z';
+
+function svgIcon(d, w, h) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', String(w));
+  svg.setAttribute('height', String(h));
+  svg.setAttribute('fill', 'currentColor');
+  svg.setAttribute('aria-hidden', 'true');
+  const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  p.setAttribute('d', d);
+  svg.appendChild(p);
+  return svg;
+}
+
+function setPlayBtn(d, label) {
+  els.playPause.textContent = '';
+  els.playPause.appendChild(svgIcon(d, 13, 13));
+  const span = document.createElement('span');
+  span.textContent = label;
+  els.playPause.appendChild(span);
+}
+
 // ---- Event hooks from content.js -----------------------------------------
 window.addEventListener('ttsr-index-changed', (e) => {
   const idx = (e.detail && e.detail.index) || 0;
@@ -304,7 +349,7 @@ window.addEventListener('ttsr-index-changed', (e) => {
 window.addEventListener('ttsr-status-changed', (e) => {
   const d = e.detail || {};
   playState = (d.isPlaying && !d.isPaused) ? 'playing' : (d.isPlaying ? 'paused' : 'stopped');
-  els.playPause.textContent = playState === 'playing' ? '⏸ Pause' : '▶ Play';
+  setPlayBtn(playState === 'playing' ? ICON_PAUSE_PATH : ICON_PLAY_PATH, playState === 'playing' ? 'Pause' : 'Play');
   if (d.isPlaying) {
     const page = pageForSentence(d.currentIndex || 0);
     els.status.textContent = 'sentence ' + ((d.currentIndex || 0) + 1) + ' / ' + (d.total || 0) + ' · page ' + page + ' / ' + numPages;
@@ -316,7 +361,7 @@ window.addEventListener('ttsr-status-changed', (e) => {
 });
 window.addEventListener('ttsr-end', () => {
   playState = 'stopped';
-  els.playPause.textContent = '▶ Play';
+  setPlayBtn(ICON_PLAY_PATH, 'Play');
   els.status.textContent = 'finished — press Play to read again';
 });
 

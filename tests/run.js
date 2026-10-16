@@ -560,6 +560,13 @@ async function main() {
   check('background spawns kokoro as a dedicated module worker (never in a page context)',
     /new Worker\(api\.runtime\.getURL\(KOKORO_WORKER_FILE\), \{ type: 'module' \}\)/.test(background) &&
     background.indexOf("KOKORO_WORKER_FILE = 'kokoro-worker.js'") !== -1);
+  // The Firefox transport was DEAF: kokoroSpawn() created the worker but never
+  // wired its events, so no progress/synthesized/download-done ever reached
+  // handleKokoroMessage — no download bar, and every synthesis answered only by
+  // its 180 s timeout (sentences skipped). offscreen.js does this for Chrome.
+  check('Firefox kokoroSpawn wires worker events to handleKokoroMessage (deaf transport fix)',
+    /function kokoroSpawn\(\) \{[\s\S]*?w\.onmessage = \(ev\) => \{ if \(ev && ev\.data\) handleKokoroMessage\(ev\.data\); \}/.test(background) &&
+    /function kokoroSpawn\(\) \{[\s\S]*?w\.onerror/.test(background));
   check('background terminates the kokoro worker on shutdown and arms an idle release',
     /function kokoroRelease\(\) \{[\s\S]*?kokoroWorker\.terminate\(\)/.test(background) &&
     /case 'ttsr-kokoro-shutdown':/.test(background) &&
@@ -576,6 +583,187 @@ async function main() {
     /not downloaded yet/.test(content) && /Download Kokoro model/.test(content));
   check('popup hides the voice picker for kokoro and wires the download progress bar',
     /voiceField\.style\.display = \(prefs\.engine === 'kokoro'\) \? 'none'/.test(fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8')));
+
+  // --- 12) quick-win + cancel-channel regression pins (2026-10-03 pass) -----
+  // One pin per fixed bug (the AGENT.md rule). Covers: the gcloud key moving
+  // into a request header, the piperTimeoutMs 120s cap, multilingual sentence
+  // terminators (plus the pdfviewer twin), the Kokoro worker cancel channel
+  // (a skip no longer waits out an abandoned RTF≈1 synthesis), systemSpeak's
+  // error-name source, the popup's kokoro pitch readout, the dead
+  // KOKORO_VOICES array, router log truncation, and the piper_host.py
+  // hardening (110s kill + bare-filename models).
+  {
+    const popupSrc = fs.readFileSync(path.join(ROOT, 'popup.js'), 'utf8');
+    const workerSrc = fs.readFileSync(path.join(ROOT, 'kokoro-worker.js'), 'utf8');
+    const pdfSrc = fs.readFileSync(path.join(ROOT, 'pdfviewer.js'), 'utf8');
+    const pySrc = fs.readFileSync(path.join(ROOT, 'piper-host', 'piper_host.py'), 'utf8');
+
+    // The key must never appear in a URL: query strings land in proxy and
+    // telemetry logs. (gcloudSynthesizeOne's comment mentions "?key=" — these
+    // pins target the code shapes, not the comments.)
+    check('gcloud API key travels in the X-Goog-Api-Key header, never a ?key= query',
+      (background.match(/'X-Goog-Api-Key': key/g) || []).length === 3 &&
+      /const url = CLOUD_ENDPOINT;/.test(background) &&
+      /const url = CLOUD_VOICES_ENDPOINT;/.test(background) &&
+      background.indexOf("+ '?key='") === -1);
+
+    // An uncapped pathological call (8000 chars × length_scale 4) computed to
+    // ~19 minutes, wedging the single-flight FIFO behind one dead job.
+// eslint-disable-next-line no-eval
+    const piperTimeoutMs = eval('(' + extractFn(background, 'piperTimeoutMs') + ')');
+    check('piperTimeoutMs caps at 120s so one pathological call cannot wedge the FIFO',
+      piperTimeoutMs(8000, 4) === 120000 &&
+      piperTimeoutMs(2000, 1) === 80000 &&
+      piperTimeoutMs(100, 1) === 11600);
+
+    // The shipped splitter, executed: danda (Hindi/Marathi), fullwidth CJK
+    // (no spaces required), Arabic ؟ — plus the unchanged Latin + digit
+    // list-marker behavior.
+// eslint-disable-next-line no-eval
+    const splitSentences = eval('(' + extractFn(content, 'splitSentences') + ')');
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    check('splitSentences recognizes Devanagari danda (।)',
+      eq(splitSentences('नमस्ते दुनिया। यह दूसरा वाक्य है।'), ['नमस्ते दुनिया।', 'यह दूसरा वाक्य है।']));
+    check('splitSentences recognizes CJK 。！？ without spaces',
+      eq(splitSentences('こんにちは。お元気ですか？はい。'), ['こんにちは。', 'お元気ですか？', 'はい。']));
+    check('splitSentences recognizes Arabic ؟',
+      eq(splitSentences('كيف حالك؟ أنا بخير.'), ['كيف حالك؟', 'أنا بخير.']));
+    check('splitSentences keeps Latin prose and digit list markers as before',
+      eq(splitSentences('One. Two! Three?'), ['One.', 'Two!', 'Three?']) &&
+      eq(splitSentences('1. first item 2. second item'), ['1. first item 2. second item']));
+
+    // pdfviewer.js precomputes a sentence→page map with a regex that MUST
+    // stay byte-identical to content.js's, or page flips drift off.
+    const termRe = /\/\[\.!\?。！？।॥؟\]\+\(.*?\|\$\)\/g/;
+    const contentTerms = content.match(termRe);
+    const pdfTerms = pdfSrc.match(termRe);
+    check('pdfviewer sentence-terminator regex stays byte-identical to content.js',
+      !!contentTerms && !!pdfTerms && contentTerms[0] === pdfTerms[0]);
+
+    // The cancel channel end-to-end: skip bumps the watermark AND posts a
+    // note; the worker stops the abandoned job at the next chunk boundary;
+    // background rejects with a sentinel that both content and the router
+    // treat as silent (no retry, no hiccup, no console spam).
+    check('background kokoroCancel posts a worker cancel note (no-op when the worker is down)',
+      /kokoroPost\(\{ type: 'cancel' \}\)\.catch\(\(\) => \{\}\);/.test(background));
+    check('worker resets the cancel flag per job and checks it between chunks',
+      /if \(msg\.type === 'cancel'\) \{\s*cancelRequested = true;/.test(workerSrc) &&
+      /if \(msg\.type === 'synthesize'\) \{\s*cancelRequested = false;/.test(workerSrc) &&
+      /for \(let i = 0; i < chunks\.length; i\+\+\) \{\s*if \(cancelRequested\) \{/.test(workerSrc));
+    check('worker replies cancelled; background rejects with the sentinel and arms idle release',
+      /self\.postMessage\(\{ type: 'cancelled', id: msg\.id \}\);/.test(workerSrc) &&
+      /kokoroArmIdleRelease\(\);\s*p\.reject\(new Error\('Kokoro synthesis cancelled'\)\);/.test(background));
+    check('content and the router treat the cancel sentinel as silent (no retry, hiccup, or log)',
+      /if \(msg === 'Kokoro synthesis cancelled'\) return;/.test(content) &&
+      /if \(e !== 'Kokoro synthesis cancelled'\) \{/.test(background));
+
+    check('systemSpeak reads the error name from the event, not the utterance',
+      /u\.onerror = \(ev\) =>/.test(content) &&
+      content.indexOf('u.error && u.error.name') === -1);
+    check('popup shows pitch n/a for gfree AND kokoro (neither has pitch control)',
+      (popupSrc.match(/\(prefs\.engine === 'gfree' \|\| prefs\.engine === 'kokoro'\) \? 'n\/a' : prefs\.pitch\.toFixed\(1\)/g) || []).length === 2);
+    check('dead KOKORO_VOICES array removed from popup',
+      popupSrc.indexOf('KOKORO_VOICES') === -1);
+    check('router failure logs truncate page text to 80 chars',
+      (background.match(/String\(msg\.text\)\.slice\(0, 80\)/g) || []).length === 2);
+
+    check('piper host kills a hung piper at 110s (just under the 120s extension cap)',
+      /timeout=110,/.test(pySrc) && /timed out/.test(pySrc));
+    check('piper host honors only bare model filenames (no path traversal)',
+      /Only bare filenames are honored/.test(pySrc) &&
+      /os\.path\.basename/.test(pySrc));
+    // Strict "downloaded" check + honest Play fast-fail. The old cache check
+    // treated ANY cached URL containing Kokoro-82M as "downloaded" — tiny
+    // sidecar files (config/tokenizer JSONs) satisfied it, the popup said
+    // "stored locally" with no progress bar, and the real ~88 MB weights
+    // fetch then ran silently inside the first synthesis call, blowing the
+    // 180s timeout. The check must require the .onnx weights with a real
+    // body; Play must say "still downloading, N%" while that fetch runs.
+    const chm = background.match(/async function kokoroCacheHasModel\(\) \{[\s\S]*?\n\}/);
+    check('kokoro cache check requires the .onnx weights with a >=40MB body (sidecars never satisfy it)',
+      !!chm && /\.onnx/.test(chm[0]) && /40000000/.test(chm[0]) && /Kokoro-82M/.test(chm[0]));
+    check('kokoro Play fast-fail is honest while a download runs (still downloading, N% done)',
+      /still downloading, ' \+ Math\.round\(kokoroProgress\.pct \|\| 0\) \+ '% done'/.test(background) &&
+      /Kokoro model not downloaded yet/.test(background));
+    // Bold filled SVG transport icons replaced the unclear Unicode glyphs
+    // (which rendered thin or as emoji depending on OS/font).
+    const popupHtmlSrc = fs.readFileSync(path.join(ROOT, 'popup.html'), 'utf8');
+    const pdfHtmlSrc = fs.readFileSync(path.join(ROOT, 'pdfviewer.html'), 'utf8');
+    const noGlyphs = (s) => !/[⏮⏸⏭■]/.test(s);
+    check('popup transport uses filled SVG icons (no Unicode glyphs)',
+      noGlyphs(popupHtmlSrc) && noGlyphs(popupSrc) &&
+      /<svg viewBox="0 0 24 24"/.test(popupHtmlSrc) && /fill="currentColor"/.test(popupSrc));
+    check('on-page player uses filled SVG icons; the toggle swaps play/pause SVGs',
+      noGlyphs(content) && /toggle\.innerHTML = STATE\.isPaused \? ICON\.play : ICON\.pause;/.test(content) &&
+      /'<svg viewBox="0 0 24 24"/.test(content));
+    check('pdfviewer transport uses filled SVG icons on both sides',
+      noGlyphs(pdfHtmlSrc) && noGlyphs(pdfSrc) && /ICON_PLAY/.test(pdfSrc) && /ICON_PAUSE/.test(pdfSrc) &&
+      /<svg viewBox="0 0 24 24"/.test(pdfHtmlSrc));
+    // Voice picker commit race: clearing voiceList/voiceRows before the async
+    // fetch left an empty-list window where a datalist pick's commit found no
+    // match and silently dropped the first selection ("must select it twice");
+    // Firefox also fires only 'input' (not 'change') for datalist picks.
+    check('popup voice list is rebuilt atomically (no clear-before-await race)',
+      /const next = \[\];/.test(popupSrc) && /voiceList = next;/.test(popupSrc) &&
+      !!(() => {
+        const rvl = popupSrc.match(/async function rebuildVoiceList\(\) \{[\s\S]*?\n  \}/);
+        return rvl && /const next = \[\];/.test(rvl[0]) && /voiceList = next;/.test(rvl[0]) &&
+          !/voiceList = \[\];/.test(rvl[0]);
+      })());
+    check('popup commits exact datalist matches on input (Firefox fires only input there)',
+      /e\.inputType && e\.inputType\.indexOf\('delete'\) === 0/.test(popupSrc) &&
+      /if \(exact && !isDelete\)/.test(popupSrc) &&
+      /if \(active\) els\.voiceSearch\.value = active\.label;/.test(popupSrc));
+    check('pdfviewer voice list is atomic, commits on input, never clobbers typing',
+      /voiceRows = next;/.test(pdfSrc) &&
+      /document\.activeElement !== els\.voiceSearch/.test(pdfSrc) &&
+      /if \(exact && !isDelete\)/.test(pdfSrc));
+    const sdIdx = content.indexOf('/still downloading/');
+    const sdRegion = sdIdx >= 0 ? content.slice(sdIdx, sdIdx + 700) : '';
+    check('content waits out an in-flight Kokoro download (no retry burn, live percentage)',
+      sdIdx >= 0 && /audioPlay\(i, retryLeft\)/.test(sdRegion) &&
+      /playback starts when it finishes/.test(sdRegion));
+    // Activity-based synthesis timeout: progress reports re-arm the pending
+    // timers, so a slow-but-healthy model load (~116 s measured + warm-up)
+    // never trips the fixed 180 s clock — only 180 s of total silence does.
+    check('kokoro timeouts are activity-based (progress re-arms pending timers)',
+      /bump: arm,/.test(background) &&
+      /kokoroPending\.forEach\(\(p\) => \{ if \(p\.bump\) p\.bump\(\); \}\)/.test(background) &&
+      /m\.type === 'chunk-progress'/.test(background));
+    check('popup shows a failed Kokoro download instead of silently re-showing the pitch',
+      /Download failed: ' \+ st\.error/.test(popupSrc));
+    // The old stop path filled only half the viewBox — a ~5px square at the
+    // rendered size, illegible. The fuller path reads clearly at 14px.
+    check('stop icons use the fuller M5 5h14v14H5z path (readable at 14px)',
+      /M5 5h14v14H5z/.test(popupHtmlSrc) && /M5 5h14v14H5z/.test(content) &&
+      /M5 5h14v14H5z/.test(pdfHtmlSrc));
+    // Android: context-menu start — a popup-free one-tap read. Fenix shows
+    // browserAction popups as a cramped sheet; the menu drives the tab's
+    // content script with the same ttsr-play message the popup's Play sends.
+    const manifestSrc = fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8');
+    const chromeManifestSrc = fs.readFileSync(path.join(ROOT, 'build-source/manifest.chrome.json'), 'utf8');
+    const menuIdx = background.indexOf('ttsr-read-page');
+    const menuRegion = menuIdx >= 0 ? background.slice(menuIdx) : '';
+    check('Android context-menu start wired (permission + menu + prefs-driven ttsr-play)',
+      /"contextMenus"/.test(manifestSrc) && /"contextMenus"/.test(chromeManifestSrc) &&
+      menuIdx >= 0 && /contexts: \['page'\]/.test(menuRegion) &&
+      /type: 'ttsr-play',/.test(menuRegion) &&
+      /fromIndex: 0,/.test(menuRegion));
+    // Security: the gcloud key flow — validated against Google BEFORE it is
+    // stored (the old order stored first, so a typo overwrote a working key,
+    // and "✓ key works" only meant "a key is present").
+    check('gcloud ping really validates against Google (accepts a candidate key)',
+      /async function gcloudPing\(candidateKey\)/.test(background) &&
+      /gcloudPing\(msg && msg\.key\)/.test(background) &&
+      /'X-Goog-Api-Key': key \}/.test(background));
+    check('popup stores the gcloud key only after validation succeeds',
+      /ttsr-gcloud-ping', key: k \}/.test(popupSrc) &&
+      popupSrc.indexOf("ttsr-gcloud-ping', key: k }") <
+        popupSrc.indexOf("api.storage.local.set({ ttsr_gcloud_key: k })") &&
+      /api\.storage\.local\.set\(\{ ttsr_gcloud_key: k \}\)/.test(popupSrc));
+    check('piper host lets synthesize() validate scales (no opaque float in main)',
+      !/float\(msg\.get\("length_scale"/.test(pySrc));
+  }
 
   console.log(failures === 0 ? 'ALL TESTS PASSED' : failures + ' FAILURES');
   process.exit(failures === 0 ? 0 : 1);

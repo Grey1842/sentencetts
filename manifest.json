@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "SentenceTTS Reader",
-  "version": "2.3.4",
+  "version": "2.3.5",
   "description": "Reads any webpage or PDF aloud with live sentence highlighting — offline via your browser's voices or the built-in Kokoro engine, or online with Google Cloud Text-to-Speech (incl. English-India neural voices). Piper needs a one-time local setup; the popup shows the steps.",
-  "permissions": ["storage", "activeTab", "nativeMessaging"],
+  "permissions": ["storage", "activeTab", "nativeMessaging", "contextMenus"],
   "host_permissions": [
     "<all_urls>",
     "file:///*",

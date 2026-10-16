@@ -72,8 +72,14 @@ From the popup: **Play/Pause, Stop, Next, Prev**, plus rate/pitch sliders (where
 the engine supports them), an engine picker, and a searchable voice picker
 (per-engine voice source). Firefox closes ephemeral popups the moment the page
 regains focus, so once a read starts a small **player is pinned to the page
-bottom** (⏮ ⏸/▶ ⏭ ■ + sentence counter) that keeps working regardless of the
+bottom** (filled SVG prev/play-pause/next/stop buttons + sentence counter) that
+keeps working regardless of the
 popup. On the page: **click any sentence to jump to it**.
+
+**On Android (Fenix 142+):** the popup opens as a cramped sheet — instead,
+**long-press the page → "Read this page aloud"** (the context menu) starts the
+read with your saved settings in one tap; the on-page player provides all
+playback control. Use the popup only for engine/voice setup.
 
 Settings (engine, voice, speed, pitch, and your Google Cloud key) persist across
 popup close/reopen via `storage.local`.
@@ -238,7 +244,9 @@ isn't registered — see `PIPER_SETUP.md`.
 ## Known limitations
 
 - Sentence splitting is punctuation-based — imperfect on heavy abbreviations,
-  solid on prose like novel chapters.
+  solid on prose like novel chapters. Terminators are multilingual: Latin
+  `.!?`, Devanagari danda `।॥` (Hindi/Marathi), fullwidth CJK `。！？`, and
+  Arabic `؟` are all recognized.
 - Paragraphs with inline formatting (bold/links mid-sentence) get flattened to
   plain text when split into sentence spans.
 - Content detection is a heuristic (`article`/`main`/`[class*="content"]`… scored
@@ -246,8 +254,8 @@ isn't registered — see `PIPER_SETUP.md`.
   region and the scoring can be tuned.
 - `gfree` has no speed/pitch control (the endpoint doesn't accept those); the
   popup shows `n/a` for them when that engine is selected. Kokoro supports rate
-  but not pitch (the help line in the popup says so; the pitch readout is still
-  shown as a number — known cosmetic bug).
+  but not pitch either (the model has no pitch parameter), so its pitch
+  readout now shows `n/a` too, matching `gfree`.
 - Kokoro's audio quality is fine; its **speed is the device-dependent part**. If
   synthesis can't keep up, you hear gaps at high playback rates — pick a lower
   rate, or `piper`/`gcloud`. The 88 MB model download has no resume-across-

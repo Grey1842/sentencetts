@@ -141,6 +141,15 @@ body {
   color: var(--danger);
 }
 
+/* Filled SVG transport icons inherit button color via currentColor; align
+   them to the text baseline inside the buttons. */
+.icon-btn svg,
+.play-btn svg,
+.stop-btn svg,
+.mini-btn svg {
+  vertical-align: -2px;
+}
+
 .status {
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;

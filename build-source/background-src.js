@@ -64,7 +64,10 @@ function piperTimeoutMs(textLength, lengthScale) {
   const baseMsPerChar = 9;  // ~9ms per char at length_scale=1.0
   const overheadMs = 2000;  // model loading + connection overhead
   const margin = 4;         // 4x safety margin
-  return Math.ceil((textLength * baseMsPerChar * lengthScale + overheadMs) * margin);
+  // Cap: a pathological call (8000 chars x length_scale 4) computed to
+  // ~19 minutes, wedging the single-flight FIFO behind one dead job. 120s
+  // is the ceiling; the Python host kills a hung piper at 110s, just below.
+  return Math.min(120000, Math.ceil((textLength * baseMsPerChar * lengthScale + overheadMs) * margin));
 }
 
 // Split text into <=max-char chunks at word boundaries.
@@ -95,6 +98,7 @@ function chunkText(text, max) {
 // ============================================================
 
 const CLOUD_ENDPOINT = 'https://texttospeech.googleapis.com/v1/text:synthesize';
+const CLOUD_VOICES_ENDPOINT = 'https://texttospeech.googleapis.com/v1/voices';
 
 // Google's plain-text `input.text` is capped around 5000 bytes; a single
 // sentence longer than that previously failed as a whole and was skipped
@@ -110,7 +114,12 @@ async function getCloudKey() {
 }
 
 async function gcloudSynthesizeOne(text, key, voice, rate, pitchSemitones) {
-  const url = CLOUD_ENDPOINT + '?key=' + encodeURIComponent(key);
+  // The key travels in the X-Goog-Api-Key request header, not a ?key= query
+  // param — query strings are written into proxy and server access logs, and
+  // this extension promises no key leakage. The header is explicitly allowed
+  // by the endpoint's CORS preflight (access-control-allow-headers includes
+  // x-goog-api-key), so this works from the extension origin in both browsers.
+  const url = CLOUD_ENDPOINT;
 
   const languageCode = (voice || '').split('-').slice(0, 2).join('-') || 'en-IN';
   const body = {
@@ -127,7 +136,7 @@ async function gcloudSynthesizeOne(text, key, voice, rate, pitchSemitones) {
   try {
     resp = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key },
       body: JSON.stringify(body),
     });
   } catch (e) {
@@ -159,12 +168,32 @@ async function gcloudSynthesize(text, voice, rate, pitchSemitones) {
   return parts;
 }
 
-async function gcloudListVoices() {
-  const key = await getCloudKey();
-  const url = 'https://texttospeech.googleapis.com/v1/voices?key=' + encodeURIComponent(key);
+// Lightweight REAL key validation: a voices-list call is free, fast, and
+// surfaces Google's own error for an invalid key. The popup's Save button
+// sends the candidate key here BEFORE storing it, so a typo cannot replace
+// a working key and "✓ key works" actually means the API accepted it.
+async function gcloudPing(candidateKey) {
+  const key = candidateKey || (await getCloudKey());
   let resp;
   try {
-    resp = await fetch(url);
+    resp = await fetch(CLOUD_VOICES_ENDPOINT, { headers: { 'X-Goog-Api-Key': key } });
+  } catch (e) {
+    throw new Error('Network error contacting Google TTS: ' + (e && e.message));
+  }
+  if (!resp.ok) {
+    let msg = 'HTTP ' + resp.status;
+    try { const j = await resp.json(); if (j.error) msg = j.error.message || msg; } catch (_) { /* not JSON */ }
+    throw new Error(msg);
+  }
+}
+
+async function gcloudListVoices() {
+  const key = await getCloudKey();
+  const url = CLOUD_VOICES_ENDPOINT;
+  let resp;
+  try {
+    // Same key-in-header rule as gcloudSynthesizeOne — never ?key= in the URL.
+    resp = await fetch(url, { headers: { 'X-Goog-Api-Key': key } });
   } catch (e) {
     throw new Error('Network error listing Google voices: ' + (e && e.message));
   }
@@ -363,8 +392,24 @@ function kokoroEnsureHost() {
 }
 
 function kokoroSpawn() {
-  // Firefox only: DOM-window background page, Worker exists here.
+  // Firefox only: DOM-window background page, Worker exists here. The worker's
+  // events (progress / synthesized / synth-error / cancelled / download-*) MUST
+  // be wired here — offscreen.js does exactly this for the Chrome build, and
+  // without this wiring the Firefox transport is deaf: no progress ever reaches
+  // handleKokoroMessage (no download bar), every synthesis answers only by its
+  // 180 s timeout (sentences skipped one by one), and download-done never lands
+  // (the popup flip-flops on the cache check instead).
   const w = new Worker(api.runtime.getURL(KOKORO_WORKER_FILE), { type: 'module' });
+  w.onmessage = (ev) => { if (ev && ev.data) handleKokoroMessage(ev.data); };
+  w.onerror = (ev) => {
+    // Worker-level failure (bad import, missing vendor file): report in the
+    // same shape the offscreen bridge uses so pending callers fail with the
+    // real reason instead of burning their timeouts.
+    handleKokoroMessage({
+      type: '__kokoroError',
+      error: 'Kokoro worker failed to start: ' + ((ev && ev.message) || 'unknown error'),
+    });
+  };
   kokoroWorker = w;
   return Promise.resolve(w);
 }
@@ -403,6 +448,14 @@ function handleKokoroMessage(m) {
   if (m.type === 'progress') {
     kokoroProgress = { phase: m.phase, pct: m.pct, detail: m.detail };
     if (m.phase === 'ready') kokoroModelLoaded = true;
+    // Progress = the worker is alive: re-arm every in-flight job's timer so a
+    // slow model load / download never trips the synthesis timeout (see
+    // kokoroCall's activity-based arm).
+    kokoroPending.forEach((p) => { if (p.bump) p.bump(); });
+  } else if (m.type === 'chunk-progress') {
+    // Per-chunk synthesis heartbeat: re-arm this job's timer only.
+    const p = kokoroPending.get(m.id);
+    if (p && p.bump) p.bump();
   } else if (m.type === 'synthesized') {
     let audio = m.audio;
     if (!audio && m.audioB64) {
@@ -413,6 +466,18 @@ function handleKokoroMessage(m) {
   } else if (m.type === 'synth-error') {
     const p = kokoroPending.get(m.id);
     if (p) { kokoroPending.delete(m.id); p.reject(new Error(m.error || 'Kokoro synthesis failed')); }
+  } else if (m.type === 'cancelled') {
+    // The worker dropped an in-flight job between chunks after our 'cancel'
+    // note (skip / jump / click-to-jump moved the read head). Reject with the
+    // sentinel message content treats as silent — and arm the idle release:
+    // the watermark already stale-dropped every queued job behind this one,
+    // so the queue is empty and this is a legitimate idle point.
+    const p = kokoroPending.get(m.id);
+    if (p) {
+      kokoroPending.delete(m.id);
+      kokoroArmIdleRelease();
+      p.reject(new Error('Kokoro synthesis cancelled'));
+    }
   } else if (m.type === 'download-done') {
     kokoroModelLoaded = true;
     kokoroProgress = { phase: 'ready', pct: 100, detail: '' };
@@ -446,13 +511,25 @@ function kokoroCall(payload, timeoutMs) {
     kokoroEnsureHost().then(() => {
       const id = kokoroNextId++;
       payload.id = id;
-      const timer = setTimeout(() => {
-        kokoroPending.delete(id);
-        reject(new Error('Kokoro synthesis timed out'));
-      }, timeoutMs);
+      let timer = null;
+      // Activity-based timeout: every progress report from the worker re-arms
+      // this timer, so a slow-but-healthy model load (measured ~116 s on a
+      // 1.2 GHz i3, plus WASM warm-up) never trips the fixed synthesis
+      // timeout — only `timeoutMs` of total silence does. A fixed deadline
+      // skipped sentence after sentence on slow machines: the load ran fine,
+      // but the first chunk landed after the clock had already fired.
+      const arm = () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          kokoroPending.delete(id);
+          reject(new Error('Kokoro synthesis timed out'));
+        }, timeoutMs);
+      };
+      arm();
       kokoroPending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
+        bump: arm,
       });
       kokoroPost(payload).catch((e) => {
         kokoroPending.delete(id);
@@ -463,12 +540,20 @@ function kokoroCall(payload, timeoutMs) {
   });
 }
 
-// Monotonic cancel watermark — same mechanism as piperCancel (see §3). No
-// interrupt of an in-flight synthesis (can't abort inference mid-pass); queued
-// jobs are dropped by the watermark, the running one finishes and its result
-// is discarded by content's gen guard.
+// Monotonic cancel watermark — same mechanism as piperCancel (see §3). Queued
+// jobs are dropped by the watermark. The RUNNING job additionally gets a
+// 'cancel' note posted to the worker: inference can't be aborted mid-pass,
+// but the worker checks between chunks, so an abandoned multi-chunk sentence
+// stops after the chunk in flight and the next real job starts immediately
+// instead of queueing behind its own dead predecessor (RTF≈1 hardware made
+// that seconds of dead-air delay per skip). The worker replies 'cancelled',
+// which rejects the pending promise with the sentinel message content's
+// audioPlay catch silently ignores (no retry, no hiccup). Posting is a no-op
+// when the worker is already down (Stop tore it down): the rejection is
+// swallowed here, never in the skip path.
 function kokoroCancel() {
   kokoroWatermark += 1;
+  kokoroPost({ type: 'cancel' }).catch(() => {});
 }
 
 function kokoroEnqueue(task) {
@@ -489,7 +574,14 @@ async function kokoroSynthesize(text, voice, speed) {
   // plays nothing". The popup's Download button is the consent gate; direct
   // users there instead of auto-downloading.
   if (!(await kokoroModelReady())) {
-    throw new Error('Kokoro model not downloaded yet — open the popup and press "Download Kokoro model" once.');
+    // Keep the leading "not downloaded yet" phrase — content.js treats it as a
+    // terminal hiccup (no per-sentence retry storm). Append live progress when
+    // a download is already running so the hiccup explains the wait instead of
+    // pretending the model was never requested.
+    const waiting = (kokoroProgress.phase === 'downloading' || kokoroProgress.phase === 'loading')
+      ? ' — still downloading, ' + Math.round(kokoroProgress.pct || 0) + '% done'
+      : '';
+    throw new Error('Kokoro model not downloaded yet' + waiting + '. Open the popup and press "Download Kokoro model" once.');
   }
   const res = await kokoroCall({
     type: 'synthesize',
@@ -501,18 +593,34 @@ async function kokoroSynthesize(text, voice, speed) {
   return res;
 }
 
-// Downloaded-check without loading the model: transformers.js caches fetched
-// files in Cache Storage under 'transformers-cache'. Matching on the model id
-// keeps this robust against URL-shape changes. null = cannot determine
-// (Cache Storage unavailable), so the popup never lies.
+// Downloaded-check without loading the model: transformers.js caches every
+// fetched file in Cache Storage under 'transformers-cache' — including tiny
+// sidecars (config.json, tokenizer.json, voice .bin) whose URLs ALSO contain
+// the model id. Matching on the model id alone lied "downloaded" while the
+// ~88 MB q8 .onnx weights were still missing: the popup said "loaded locally"
+// with no progress bar, and Play passed the readiness gate only to start the
+// REAL download inside the 180 s synthesis timeout and never speak. So:
+// require the actual .onnx entry with a weights-sized body (>= 40 MB),
+// memoized once found so status polling never re-reads 88 MB repeatedly.
+// null = cannot determine (Cache Storage unavailable) — never a blind false.
+let kokoroWeightsVerified = false;
 async function kokoroCacheHasModel() {
+  if (kokoroWeightsVerified) return true;
   if (typeof caches === 'undefined') return null;
   try {
     const names = await caches.keys();
     for (const n of names) {
       if (!/transformers/i.test(n)) continue;
-      const keys = await caches.open(n).then((c) => c.keys());
-      if (keys.some((r) => /Kokoro-82M/i.test(r.url))) return true;
+      const cache = await caches.open(n);
+      const keys = await cache.keys();
+      for (const r of keys) {
+        if (!/Kokoro-82M/i.test(r.url) || !/\.onnx/i.test(r.url)) continue;
+        const res = await cache.match(r);
+        if (!res) continue;
+        let len = Number(res.headers.get('content-length') || 0);
+        if (!len) len = (await res.arrayBuffer()).byteLength;
+        if (len >= 40000000) { kokoroWeightsVerified = true; return true; }
+      }
     }
     return false;
   } catch (e) {
@@ -717,21 +825,24 @@ async function fetchPdfRoute(url, originTabId) {
   try {
     resp = await fetch(u, { credentials: 'include' });
   } catch (e) {
-if (/^file:/i.test(u)) {
-        const isAllowed = await isAllowedFileScheme();
-        if (!isAllowed) {
-          throw new Error(
-            'Local file access is OFF for this extension. ' +
-            (IS_FIREFOX
-              ? 'Go to about:addons → SentenceTTS Reader → Permissions and enable "Allow access to file URLs". '
-              : 'Go to the extension\'s details page (chrome://extensions) and enable "Allow access to file URLs". ') +
-            'Then press Read again.'
-          );
-        }
-        // Grant present but the direct fetch still failed — the reader falls
-        // back to a file picker, so point the user at it.
-        throw new Error('Local file blocked in this browser — use "Choose the PDF file…" below.');
+    // file: URLs fail the fetch outright when the extension lacks the
+    // "Allow access to file URLs" grant — distinguish that fixable case from
+    // a plain network failure.
+    if (/^file:/i.test(u)) {
+      const isAllowed = await isAllowedFileScheme();
+      if (!isAllowed) {
+        throw new Error(
+          'Local file access is OFF for this extension. ' +
+          (IS_FIREFOX
+            ? 'Go to about:addons → SentenceTTS Reader → Permissions and enable "Allow access to file URLs". '
+            : 'Go to the extension\'s details page (chrome://extensions) and enable "Allow access to file URLs". ') +
+          'Then press Read again.'
+        );
       }
+      // Grant present but the direct fetch still failed — the reader falls
+      // back to a file picker, so point the user at it.
+      throw new Error('Local file blocked in this browser — use "Choose the PDF file…" below.');
+    }
     throw new Error('Could not fetch the PDF: ' + String((e && e.message) || e));
   }
   if (!resp.ok) throw new Error('HTTP ' + resp.status + ' fetching PDF');
@@ -823,8 +934,14 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         })
         .catch((err) => {
           const e = String((err && err.message) || err);
-          console.error('[SentenceTTS][background][kokoro] synthesis failed:', e);
-          console.error('[SentenceTTS][background][kokoro] text:', msg.text);
+          // A worker-side cancel (skip / jump / click-to-jump) is a normal user
+          // action, not a failure — don't log it; the sentinel is exactly what
+          // content's catch ignores silently, so the console stays clean.
+          if (e !== 'Kokoro synthesis cancelled') {
+            console.error('[SentenceTTS][background][kokoro] synthesis failed:', e);
+            // Truncated: full page text in the background console is a privacy smell.
+            console.error('[SentenceTTS][background][kokoro] text:', String(msg.text).slice(0, 80));
+          }
           sendResponse({ ok: false, error: e });
         });
       return true;
@@ -895,13 +1012,18 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           // Log the full Piper error (verbatim stderr/traceback from the host)
           // to the background console so it can be copied and reported.
           console.error('[SentenceTTS][background][piper] synthesis failed:', e);
-          console.error('[SentenceTTS][background][piper] text:', msg.text);
+          // Truncated: full page text in the background console is a privacy smell.
+          console.error('[SentenceTTS][background][piper] text:', String(msg.text).slice(0, 80));
           sendResponse({ ok: false, error: e });
         });
       return true;
 
     case 'ttsr-gcloud-ping':
-      getCloudKey()
+      // Real validation, not a presence check: a voices call is free and
+      // returns Google's own reason ("API key not valid") for a bad key.
+      // msg.key lets the popup validate BEFORE persisting, so a typo can
+      // never overwrite a working key.
+      gcloudPing(msg && msg.key)
         .then(() => sendResponse({ ok: true }))
         .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
       return true;
@@ -922,3 +1044,43 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return false;
   }
 });
+
+// ============================================================
+// Android support: context-menu start
+// ============================================================
+// Fenix shows browserAction popups as a cramped bottom sheet and offers no
+// keyboard for shortcuts on most pages, so the popup alone is a poor Android
+// UX. A context-menu item gives Android (and desktop) users a one-tap start:
+// it drives the tab's content script with the exact same ttsr-play message
+// the popup's Play button sends, using the prefs saved in storage. The
+// content script's existing ttsr-play handler prepares the page and starts
+// playback; the on-page player then provides pause/next/prev/stop, so the
+// popup is only ever needed for engine setup. removeAll+create keeps this
+// idempotent across service-worker / event-page restarts (a plain create
+// with a fixed id throws "duplicate id" on the second run).
+if (api.contextMenus && api.contextMenus.onClicked) {
+  const MENU_READ_PAGE = 'ttsr-read-page';
+  api.contextMenus.removeAll(() => {
+    api.contextMenus.create({
+      id: MENU_READ_PAGE,
+      title: 'Read this page aloud',
+      contexts: ['page'],
+    });
+  });
+  api.contextMenus.onClicked.addListener((info, tab) => {
+    if (!info || info.menuItemId !== MENU_READ_PAGE) return;
+    if (!tab || typeof tab.id !== 'number') return;
+    // Same shape the popup's Play sends (popup.js applyPlaySettings consumes
+    // engine/voice/speed/pitch; fromIndex 0 starts from the top).
+    api.storage.local.get(['ttsr_engine', 'ttsr_speed', 'ttsr_pitch', 'ttsr_voice'])
+      .then((s) => api.tabs.sendMessage(tab.id, {
+        type: 'ttsr-play',
+        engine: s.ttsr_engine || 'gfree',
+        voice: s.ttsr_voice || '',
+        speed: typeof s.ttsr_speed === 'number' ? s.ttsr_speed : 1,
+        pitch: typeof s.ttsr_pitch === 'number' ? s.ttsr_pitch : 1,
+        fromIndex: 0,
+      }).catch(() => {}))
+      .catch(() => {});
+  });
+}

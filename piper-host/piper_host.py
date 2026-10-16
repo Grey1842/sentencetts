@@ -106,22 +106,24 @@ def list_models():
 
 
 def find_model_file(model_name):
-    """Find a model file by name across all VOICES_DIRS."""
+    """Find a model file by its bare filename across all VOICES_DIRS.
+
+    Security: the `model` field arrives from extension storage and is never
+    trusted as a path. Only bare filenames are honored — absolute paths and
+    anything containing a path separator are rejected outright, so a tampered
+    preference cannot point the piper binary at an arbitrary file on disk.
+    """
     if not model_name:
         return None
-    # If absolute or relative path already exists, use it
-    if os.path.isabs(model_name) and os.path.isfile(model_name):
-        return model_name
-    # Search in each VOICES_DIR
+    name = str(model_name).strip()
+    if not name or name != os.path.basename(name):
+        # Rejects absolute paths, "dir/model.onnx", "./model.onnx" and
+        # trailing slashes — anything that is not a plain filename.
+        return None
     for d in VOICES_DIRS:
-        # Try direct basename match first
-        cand = os.path.join(d, os.path.basename(model_name))
+        cand = os.path.join(d, name)
         if os.path.isfile(cand):
             return cand
-        # Try relative path match
-        cand2 = os.path.join(d, model_name)
-        if os.path.isfile(cand2):
-            return cand2
     return None
 
 
@@ -167,12 +169,26 @@ def synthesize(text, model, length_scale=1.0, noise_scale=0.667):
         "--noise-scale", str(noise_scale),
     ]
     log("running: " + " ".join(cmd))
-    proc = subprocess.run(
-        cmd,
-        input=text.encode("utf-8"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # Hard stop for a hung piper (wedged model, stalled I/O): subprocess.run
+    # kills the child on expiry, so a stuck synthesis can no longer pin this
+    # host's RAM while the extension times out around it. 110s sits just
+    # below the extension's 120s piperTimeoutMs ceiling, so the host usually
+    # wins the race and the extension sees a clean error. The wording
+    # contains "timed out", which the extension classifies as non-retryable
+    # — the same policy as its own sendNativeMessage timeout.
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=text.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=110,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(
+            "piper timed out after 110s (input length %d chars) — process killed"
+            % len(text)
+        )
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
         raise ValueError("piper failed (code %d): %s" % (proc.returncode, err[:500]))
@@ -196,11 +212,14 @@ def main():
             if cmd == "list":
                 send_message({"ok": True, "models": list_models()})
             elif cmd == "synthesize":
+                # No float() conversion here: synthesize() validates the scales
+                # itself and raises the clear "bad length_scale: ..." message;
+                # converting here first produced an opaque TypeError instead.
                 wav_b64 = synthesize(
                     msg.get("text", ""),
                     msg.get("model", ""),
-                    float(msg.get("length_scale", 1.0)),
-                    float(msg.get("noise_scale", 0.667)),
+                    msg.get("length_scale", 1.0),
+                    msg.get("noise_scale", 0.667),
                 )
                 send_message({"ok": True, "audio_base64": wav_b64})
             elif cmd == "shutdown":
